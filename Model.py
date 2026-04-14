@@ -831,7 +831,7 @@ class MultiModelTrainer:
         print(f"{'='*60}")
 
         try:
-            # 【修改】定义模型类型，用于多样性筛选
+            # 定义模型类型，用于多样性筛选
             model_types = {
                 'LR_Ridge': 'linear',
                 'SVM_RBF': 'kernel',
@@ -1231,7 +1231,7 @@ class MultiModelTrainer:
         # ==============================================================
         ap_candidates = ap_candidates.sort_values(by='Brier', ascending=True).reset_index(drop=True)
         best_brier = ap_candidates.iloc[0]['Brier']
-        brier_candidates = ap_candidates[ap_candidates['Brier'] <= (best_brier + 0.005)].copy()
+        brier_candidates = ap_candidates[ap_candidates['Brier'] <= (best_brier + 0.002)].copy()
 
         # ==============================================================
         # Step 7: Brier 接近时，比较 MCC（不平衡数据分类质量）
@@ -1240,7 +1240,7 @@ class MultiModelTrainer:
         if len(brier_candidates) > 1:
             brier_candidates = brier_candidates.sort_values(by='MCC', ascending=False).reset_index(drop=True)
             best_mcc = brier_candidates.iloc[0]['MCC']
-            mcc_candidates = brier_candidates[brier_candidates['MCC'] >= (best_mcc - 0.02)].copy()
+            mcc_candidates = brier_candidates[brier_candidates['MCC'] >= (best_mcc - 0.01)].copy()
         else:
             mcc_candidates = brier_candidates.copy()
 
