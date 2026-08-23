@@ -1,113 +1,67 @@
 import os
+import glob
 import joblib
-import pandas as pd
+import warnings
+
 import numpy as np
-from sklearn.metrics import brier_score_loss
-from scipy.stats import chi2
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import roc_curve, precision_recall_curve, auc
-from sklearn.calibration import calibration_curve
-from sklearn.metrics import confusion_matrix, matthews_corrcoef
-from datetime import datetime
-from scipy import stats
-import shap
-from matplotlib import rcParams
-from scipy.stats import pearsonr
-from itertools import combinations
-import matplotlib.gridspec as gridspec
-from matplotlib.ticker import MultipleLocator
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+import pandas as pd
+
 import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.cm as mcm
 import matplotlib.colors as mcolors
-# ==========================================
-# 0. 变量名 → SCI 展示标签映射
-# ==========================================
-LABEL_MAP = {
-    # 结局 / 时间变量
-    'Recurrence':              'Recurrence',
-    'Follow_up_Time':          'Follow-up time (months)',
-    'SO_Removal_Time':         'SO removal time (months)',
-    'status_cr':               'Competing risk status',
-    # 术前基线特征
-    'Diabetes':                'Diabetes',
-    'AL':                      'Axial length (mm)',
-    'BCVA_Pre':                'Preoperative BCVA (logMAR)',
-    'Lens_Status_Pre':         'Preoperative lens status',
-    'VH':                      'Vitreous hemorrhage',
-    'Macular_status':          'Macular status (on/off)',
-    'Symptom_Duration':        'Symptom duration (days)',
-    'PVR_Grade_Pre':           'Preoperative PVR grade',
-    'Choroidal_Detachment':    'Choroidal detachment',
-    'RD_Extent':               'RD extent (quadrants)',
-    # 裂孔特征
-    'number_of_breaks':        'Number of retinal breaks',
-    'Largest_Break_Diameter':  'Largest break diameter (DD)',
-    'Break_Loc_Inferior':      'Inferior break',
-    'Macular_Hole':            'Macular hole',
-    'Lattice_Degeneration':    'Lattice degeneration',
-    'Atrophic_Holes':          'Atrophic holes',
-    # 术中变量
-    'Surgery_Duration':        'Surgery duration (min)',
-    'PFCL':                    'PFCL use',
-    'Phacovitrectomy':         'Phacovitrectomy',
-    # SO removal 时变量
-    'BCVA_SOR':                'BCVA at SO removal (logMAR)',
-    'SO_Emulsification':       'Silicone oil emulsification',
-    'Concurrent_Phaco_SOR':    'Concurrent phacoemulsification at SO removal',
-    'ERM_SOR':                 'ERM at SO removal',
-    'PVR_SOR':                 'PVR at SO removal',
-    # 聚类标签
-    'Cluster_ID':              'Retinal break phenotype cluster',
-    'Break_Cluster':           'Retinal break phenotype cluster',
-}
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-def rename_feature(name):
-    """将代码变量名映射为 SCI 展示标签，未在映射表中的保持原样"""
-    return LABEL_MAP.get(name, name)
+import seaborn as sns
 
-def rename_feature_list(names):
-    """批量重命名特征列表"""
-    return [rename_feature(n) for n in names]
+from scipy.stats import chi2, chi2_contingency
+from scipy.special import expit
+from scipy.interpolate import UnivariateSpline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_curve, roc_auc_score,
+    precision_recall_curve, average_precision_score,
+    brier_score_loss, confusion_matrix, matthews_corrcoef,
+)
 
-def rename_df_feature_col(df, col='Feature'):
-    """重命名 DataFrame 中的 Feature 列"""
-    if col in df.columns:
-        df[col] = df[col].map(lambda x: LABEL_MAP.get(x, x))
-    return df
+warnings.filterwarnings('ignore')
 
-def rename_df_columns(df):
-    """重命名 DataFrame 的列名（用于特征矩阵）"""
-    return df.rename(columns=LABEL_MAP)
+# SHAP 为可选依赖（缺失时自动跳过第五部分）
+try:
+    import shap
+    HAS_SHAP = True
+except Exception as _e:                                    # pragma: no cover
+    HAS_SHAP = False
+    print(f"⚠️ 未能导入 shap（{_e}），将跳过 SHAP 模块。")
+
 
 # ==========================================
-# 1. 核心配置 
+# 路径与时间戳（如需切换数据集，改这里即可）
 # ==========================================
 DATA_PATH = "./model_results"
-TIMESTAMP = '20260216_1724' 
-
-# 绘图样式配置
+TIMESTAMP = '20260809_0008'
 DPI = 600
-COLOR_INTERNAL = '#2E75B6'
-COLOR_EXTERNAL = '#C00000'
+
+# 敏感性分析（术中模型）对应的时间戳
+TIMESTAMP_INTRA   = '20260809_0013'
+
+os.makedirs('figures', exist_ok=True)
+
 
 # ==========================================
-# 极简风格全局设置 
+# 全局绘图风格（SCI 顶刊）
 # ==========================================
 def set_sci_style():
-    """设置全局绘图风格"""
-    
-    # 1. 字体设置
     plt.rcParams['font.family'] = 'sans-serif'
     plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
-    
-    # PDF/PS 字体嵌入
     plt.rcParams['pdf.fonttype'] = 42
     plt.rcParams['ps.fonttype'] = 42
-    
-    # 统一字号 — 顶刊标准: 正文~8pt, 标签~9pt, 标题~10pt
+
     plt.rcParams['font.size'] = 9
     plt.rcParams['axes.titlesize'] = 10
     plt.rcParams['axes.labelsize'] = 9
@@ -115,12 +69,10 @@ def set_sci_style():
     plt.rcParams['ytick.labelsize'] = 8
     plt.rcParams['legend.fontsize'] = 8
     plt.rcParams['legend.title_fontsize'] = 9
-    
-    # 2. 边框与刻度
+
     plt.rcParams['axes.spines.top'] = False
     plt.rcParams['axes.spines.right'] = False
     plt.rcParams['axes.linewidth'] = 0.8
-    
     plt.rcParams['xtick.direction'] = 'out'
     plt.rcParams['ytick.direction'] = 'out'
     plt.rcParams['xtick.top'] = False
@@ -129,8 +81,7 @@ def set_sci_style():
     plt.rcParams['ytick.major.width'] = 0.8
     plt.rcParams['xtick.major.size'] = 3.5
     plt.rcParams['ytick.major.size'] = 3.5
-    
-    # 3. 图例：加框线（方便阅读），细边框，无圆角
+
     plt.rcParams['legend.frameon'] = True
     plt.rcParams['legend.edgecolor'] = '#999999'
     plt.rcParams['legend.fancybox'] = False
@@ -139,19 +90,16 @@ def set_sci_style():
     plt.rcParams['legend.labelspacing'] = 0.3
     plt.rcParams['legend.handlelength'] = 1.8
     plt.rcParams['legend.handletextpad'] = 0.5
-    
-    # 4. 保存
+
     plt.rcParams['savefig.dpi'] = 600
     plt.rcParams['savefig.bbox'] = 'tight'
     plt.rcParams['savefig.pad_inches'] = 0.05
 
 set_sci_style()
 
-# ------------------------------------------
-# 图例辅助函数（统一风格）
-# ------------------------------------------
+
 def sci_legend(ax, **kwargs):
-    """为指定 ax 添加图例（带细框线）"""
+    """统一风格图例（带细框线）"""
     defaults = dict(
         frameon=True, edgecolor='#999999', fancybox=False,
         framealpha=1.0, borderpad=0.4, labelspacing=0.3,
@@ -160,682 +108,137 @@ def sci_legend(ax, **kwargs):
     defaults.update(kwargs)
     return ax.legend(**defaults)
 
+
+# ==========================================
+# 配色（沿用原脚本 COLORS_LIST 索引）
+#   蓝色=内部验证，红色=外部验证
+# ==========================================
 COLORS_LIST = [
-    "#E64B35",  # 红色 - 主要对比色
-    "#4DBBD5",  # 青色 - 冷色调主色
-    "#00A087",  # 绿色 - 中性色
-    "#3C5488",  # 深蓝 - 专业色
-    "#F39B7F",  # 珊瑚橙 - 柔和对比
-    "#8491B4",  # 灰蓝 - 辅助色
-    "#91D1C2",  # 薄荷绿 - 清新色
-    "#DC0000",  # 深红 - 强调色
-    "#7E6148"   # 棕色 - 大地色
+    "#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F",
+    "#8491B4", "#91D1C2", "#DC0000", "#7E6148",
 ]
+C_INT      = COLORS_LIST[3]   # #3C5488 深蓝 — 内部验证
+C_EXT      = COLORS_LIST[0]   # #E64B35 红色 — 外部验证
+C_OOF_LINE = COLORS_LIST[1]   # #4DBBD5 青色（保留以兼容）
+C_EXT_LINE = COLORS_LIST[7]   # #DC0000 深红（保留以兼容）
 
-COLORS_NPG = [
-    "#E64B35",  # NPG红
-    "#4DBBD5",  # NPG青
-    "#00A087",  # NPG绿
-    "#3C5488",  # NPG蓝
-    "#F39B7F",  # NPG橙
-    "#8491B4",  # NPG紫
-    "#91D1C2",  # NPG薄荷
-    "#DC0000",  # NPG深红
-    "#7E6148",  # NPG棕
-    "#B09C85"   # 额外：驼色
-]
+# SHAP / Figure 2 等模块统一引用的队列配色别名
+COLOR_INTERNAL = C_INT
+COLOR_EXTERNAL = C_EXT
 
-# ==========================================
-# 2. 数据加载与阈值确定
-# ==========================================
-print(f"{'='*60}")
-print("📂 正在加载模型分析数据...")
-print(f"{'='*60}")
-
-# ------------------------------------------
-# 2.1 加载完整模型包 (Model_Package)
-# ------------------------------------------
-print("\n[1/8] 加载完整模型包...")
-pkl_path = f"{DATA_PATH}/Model_Package_{TIMESTAMP}.pkl"
-if not os.path.exists(pkl_path):
-    raise FileNotFoundError(f"❌ 找不到模型包: {pkl_path}")
-
-full_package = joblib.load(pkl_path)
-
-# 提取基础模型信息
-best_model = full_package['best_model']
-best_model_name = full_package['best_model_name']
-optimal_threshold = full_package['optimal_threshold']
-preprocessor = full_package['preprocessor']
-# ✅ 从模型包中提取原始数据
-X_train = full_package['X_train']
-y_train = full_package['y_train']
-X_ext = full_package['X_external']  # 如果需要
-y_ext_true = full_package['y_external']  # 如果需要
-print(f"  ✓ 训练集: {X_train.shape}")
-print(f"  ✓ 训练集标签: {y_train.shape}")
-print(f"  ✓ 外部验证集: {X_ext.shape}")
-# 提取校准模型
-calibrated_model = full_package.get('calibrated_model', None)
-
-print(f"  ✓ 最佳模型架构: {best_model_name}")
-print(f"  ✓ 最优阈值: {optimal_threshold:.4f}")
-if calibrated_model:
-    print(f"  ✓ 包含校准后模型 (Calibrated Model)")
-
-# ------------------------------------------
-# 2.2 加载核心预测数据
-# ------------------------------------------
-print("\n[2/8] 加载核心预测数据...")
-
-# A. 从 CSV 加载 (用于核对 ID 和 Label)
-df_int = pd.read_csv(f"{DATA_PATH}/Internal_Val_OOF_Preds_{best_model_name}_{TIMESTAMP}.csv")
-df_ext = pd.read_csv(f"{DATA_PATH}/External_Val_Preds_{best_model_name}_{TIMESTAMP}.csv")
-df_cv_detail = pd.read_csv(f"{DATA_PATH}/Internal_Val_CV_Metrics_Detail_{TIMESTAMP}.csv")
-
-# B. 提取真实标签
-y_int = df_int['True_Label'].values
-y_ext = df_ext['True_Label'].values
-
-# C. 从模型包中提取概率 
-# 对应保存代码 Section 7 -> 'predictions' 字典
-preds_dict = full_package['predictions']
-
-# 提取校准前的概率 (Uncalibrated)
-oof_probs = preds_dict['internal_oof_probs']
-ext_probs = preds_dict['external_probs'] 
-
-# 兼容性处理：如果 CSV 中的概率与 Pickle 中的不一致，以 Pickle 为准 (它包含最原始的浮点精度)
-prob_int = oof_probs
-prob_ext = ext_probs
-
-print(f"  ✓ 内部验证 OOF 预测: {len(df_int)} 例")
-print(f"  ✓ 外部验证预测: {len(df_ext)} 例")
+# 混淆矩阵专用连续色标（白→深蓝 / 白→红）
+cmap_int = LinearSegmentedColormap.from_list('cmap_int', ['#FFFFFF', C_INT])
+cmap_ext = LinearSegmentedColormap.from_list('cmap_ext', ['#FFFFFF', C_EXT])
 
 
-# ------------------------------------------
-# 2.3 加载 Bootstrap 稳定性分析数据
-# ------------------------------------------
-print("\n[3/7] 加载 Bootstrap 稳定性分析数据...")
-df_bootstrap_summary = pd.read_csv(f"{DATA_PATH}/External_Val_Bootstrap_1000_{TIMESTAMP}.csv", index_col=0)
-df_bootstrap_raw = pd.read_csv(f"{DATA_PATH}/External_Val_Bootstrap_RawData_{TIMESTAMP}.csv")
-bootstrap_predictions = joblib.load(f"{DATA_PATH}/Bootstrap_Predictions_{TIMESTAMP}.pkl")
+# ==========================================================
+# 零、变量名 → JAMA-style 展示标签映射
+#   （直接沿用建模脚本中的 LABEL_MAP，保证正文/表/图标签完全一致）
+# ==========================================================
+LABEL_MAP = {
+    # ---- 结局 / 时间变量 ----
+    'Recurrence':              'Retinal redetachment',
+    'Follow_up_Time':          'Follow-up time (mo)',
+    'SO_Removal_Time':         'Time to silicone oil removal (mo)',
+    'status_cr':               'Competing-risk status',
 
-print(f"  ✓ Bootstrap 汇总统计: {len(df_bootstrap_summary)} 个指标")
-print(f"  ✓ Bootstrap 原始数据: {len(df_bootstrap_raw)} 次采样")
-print(f"  ✓ Bootstrap 预测数据: {len(bootstrap_predictions)} 次迭代")
+    # ---- 术前基线特征 ----
+    'Diabetes':                'Diabetes',
+    'AL':                      'Axial length (mm)',
+    'BCVA_Pre':                'Preoperative BCVA (logMAR)',
+    'Lens_Status_Pre':         'Preoperative lens status',
+    'VH':                      'Vitreous hemorrhage',
+    'Macular_status':          'Macula-off detachment',
+    'Symptom_Duration':        'Duration of symptoms (d)',
+    'PVR_Grade_Pre':           'Preoperative PVR grade',
+    'Choroidal_Detachment':    'Choroidal detachment',
+    'RD_Extent':               'RD extent (quadrants)',
 
-# ------------------------------------------
-# 2.4 加载综合指标汇总表
-# ------------------------------------------
-print("\n[3.5/7] 加载综合指标汇总表...")
-comprehensive_summary_path = f"{DATA_PATH}/Comprehensive_Metrics_Summary_{TIMESTAMP}.csv"
-if os.path.exists(comprehensive_summary_path):
-    df_comprehensive = pd.read_csv(comprehensive_summary_path)
-    print(f"  ✓ 综合指标汇总表已加载: {len(df_comprehensive)} 行")
-    print(f"    包含指标: {list(df_comprehensive.columns)}")
-else:
-    df_comprehensive = None
-    print("  ⚠️ 综合指标汇总表未找到（可能需重新运行训练代码）")
+    # ---- 裂孔特征 ----
+    'number_of_breaks':        'Total retinal breaks (No.)',
+    'Largest_Break_Diameter':  'Largest break size (DD)',
+    'Break_Loc_Inferior':      'Inferior break',
+    'Macular_Hole':            'Macular hole',
+    'Lattice_Degeneration':    'Lattice degeneration',
+    'Atrophic_Holes':          'Atrophic hole',
 
-# 加载所有模型OOF对比表
-all_models_oof_path = f"{DATA_PATH}/All_Models_OOF_Comparison_{TIMESTAMP}.csv"
-if os.path.exists(all_models_oof_path):
-    df_all_models_oof = pd.read_csv(all_models_oof_path)
-    print(f"  ✓ 所有模型OOF对比表已加载: {len(df_all_models_oof)} 个模型")
-else:
-    df_all_models_oof = None
-    print("  ⚠️ 所有模型OOF对比表未找到")
+    # ---- 术中变量 ----
+    'Surgery_Duration':        'Operative duration (min)',
+    'PFCL':                    'Use of perfluorocarbon liquid',
+    'Phacovitrectomy':         'Combined phacovitrectomy',
 
-# ------------------------------------------
-# 2.5 加载错误分析数据
-# ------------------------------------------
-print("\n[5/8] 加载错误分析数据...")
-# 这个依然读取 CSV，因为包含具体的临床特征，CSV 更方便查看
-error_file = f"{DATA_PATH}/Error_Deep_Analysis_{TIMESTAMP}.csv"
-if os.path.exists(error_file):
-    df_error = pd.read_csv(error_file)
-    print(f"  ✓ 错误病例分析: {len(df_error)} 例")
-    print(f"    - False Positive: {len(df_error[df_error['Error_Type']=='False_Positive'])} 例")
-    print(f"    - False Negative: {len(df_error[df_error['Error_Type']=='False_Negative'])} 例")
-else:
-    print("  ⚠️ 未找到错误分析 CSV 文件")
+    # ---- SO removal 时变量 ----
+    'BCVA_SOR':                'BCVA at silicone oil removal (logMAR)',
+    'SO_Emulsification':       'Silicone oil emulsification',
+    'Concurrent_Phaco_SOR':    'Phacoemulsification at silicone oil removal',
+    'ERM_SOR':                 'Epiretinal membrane at silicone oil removal',
+    'PVR_SOR':                 'PVR at silicone oil removal',
 
-# ------------------------------------------
-# 2.7 加载 DeLong 检验数据包
-# ------------------------------------------
-print("\n[7/8] 加载 DeLong 检验数据...")
-# 对应保存代码 Section 8
-try:
-    delong_path = f"{DATA_PATH}/DeLong_Data_Package_{TIMESTAMP}.pkl"
-    if os.path.exists(delong_path):
-        delong_package = joblib.load(delong_path)
-        delong_models = delong_package['model_predictions']
-        print(f"  ✓ 成功加载 {len(delong_models)} 个模型的预测数据用于 DeLong 检验")
-    else:
-        print("  ⚠️ DeLong 数据包未找到")
-        delong_package = None
-except Exception as e:
-    print(f"  ⚠️ 加载 DeLong 数据失败: {e}")
-    delong_package = None
+}
 
-# ------------------------------------------
-# 2.8 阈值确定与验证
-# ------------------------------------------
-print("\n[8/8] 阈值确定与验证...")
+# ColumnTransformer 生成的特征名前缀（get_feature_names_out）
+_TRANS_PREFIXES = ('log__', 'num__', 'cat__', 'remainder__', 'pipeline-1__',
+                   'pipeline-2__', 'pipeline-3__', 'onehot__', 'scaler__')
 
-clinical_threshold = optimal_threshold
 
-# 验证 Key 是否存在 (带防御性)
-threshold_method = 'Unknown'
-if 'cv_results' in full_package and best_model_name in full_package['cv_results']:
-    threshold_method = full_package['cv_results'][best_model_name].get('threshold_method', 'Unknown')
+def _strip_prefix(name):
+    """去掉 ColumnTransformer 的 'num__' / 'cat__' 等前缀"""
+    s = str(name)
+    for p in _TRANS_PREFIXES:
+        if s.startswith(p):
+            return s[len(p):]
+    if '__' in s:                       # 兜底：任何 xxx__ 前缀
+        return s.split('__', 1)[1]
+    return s
 
-print(f"  ✓ 阈值计算方法: {threshold_method}")
 
-# ------------------------------------------
-# 2.9 数据完整性检查
-# ------------------------------------------
-print(f"\n{'='*60}")
-print("🔍 数据完整性检查...")
-print(f"{'='*60}")
-
-# 检查预测概率长度
-assert len(df_int) == len(oof_probs), "❌ 内部验证数据长度不一致"
-assert len(df_ext) == len(ext_probs), "❌ 外部验证数据长度不一致"
-
-is_match_int = np.allclose(df_int['Pred_Prob'].values, oof_probs, rtol=1e-4, atol=1e-5)
-is_match_ext = np.allclose(df_ext['Pred_Prob'].values, ext_probs, rtol=1e-4, atol=1e-5)
-
-if is_match_int and is_match_ext:
-    print("  ✅ CSV 与 Pickle 预测概率一致")
-else:
-    print("  ⚠️ 警告: CSV 与 Pickle 概率存在微小差异 (通常由 CSV 浮点截断导致，将优先使用 Pickle 数据)")
-
-print(f"\n{'='*60}")
-print("📊 数据加载汇总")
-print(f"{'='*60}")
-print(f"  - 内部验证 (OOF): {len(oof_probs)} 例")
-print(f"  - 外部验证: {len(ext_probs)} 例")
-print(f"  - 决策阈值: {clinical_threshold:.4f}")
-print(f"  - 包含模块: Bootstrap({'✅' if 'bootstrap_analysis' in full_package else '❌'}), "
-      f"Balanced({'✅' if 'balanced_subsets_analysis' in full_package else '❌'}), "
-      f"DeLong({'✅' if delong_package is not None else '❌'})")
-
-print(f"\n✅ 数据加载完成！准备进行可视化分析...")
-print(f"{'='*60}\n")
-
-# ==========================================
-# 2.10 概率校准 - 截距校准 (Intercept-Only Recalibration)
-# ==========================================
-
-print(f"\n{'='*60}")
-print("🔧 概率校准 - 截距校准 (Intercept-Only Recalibration)")
-print(f"{'='*60}")
-
-from scipy.special import expit as _expit
-from scipy.optimize import minimize_scalar
-from sklearn.metrics import roc_auc_score, brier_score_loss
-
-def _safe_logit(p, eps=1e-7):
-    """安全的 logit 变换"""
-    p_clipped = np.clip(p, eps, 1 - eps)
-    return np.log(p_clipped / (1 - p_clipped))
-
-def intercept_only_recalibration(y_true, y_prob, method='mle'):
+def rename_feature(name):
     """
-    截距校准 (Intercept-Only Recalibration)
-    固定 slope=1, 仅估计截距偏移量 Δb
-    logit(p_calibrated) = logit(p_original) + Δb
-    
-    Parameters
-    ----------
-    y_true : array  真实标签 (0/1)
-    y_prob : array  原始预测概率
-    method : str    'mle' (推荐) | 'prevalence' (快速近似)
-    
-    Returns
-    -------
-    delta_b, calibrated_probs, info_dict
+    将代码变量名映射为 SCI 展示标签，未在映射表中的保持原样。
+    额外处理两种 sklearn 产物：
+      · 'num__AL'              → 'Axial length (mm)'
+      · 'cat__PVR_Grade_Pre_C2'→ 'Preoperative PVR grade: C2'（独热编码水平）
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_prob = np.asarray(y_prob, dtype=float)
-    logit_p = _safe_logit(y_prob)
-    
-    info = {'method': method, 'n': len(y_true), 'n_events': int(y_true.sum()),
-            'prevalence': y_true.mean(), 'original_mean_prob': y_prob.mean()}
-    
-    if method == 'mle':
-        # MLE: 将 logit(p) 作为 offset, 仅拟合截距
-        def neg_loglik(delta_b):
-            p_cal = _expit(logit_p + delta_b)
-            p_cal = np.clip(p_cal, 1e-15, 1 - 1e-15)
-            ll = y_true * np.log(p_cal) + (1 - y_true) * np.log(1 - p_cal)
-            return -np.sum(ll)
-        
-        result = minimize_scalar(neg_loglik, bounds=(-5, 5), method='bounded')
-        delta_b = result.x
-        
-        # Fisher information → SE
-        p_cal = _expit(logit_p + delta_b)
-        p_cal_clipped = np.clip(p_cal, 1e-15, 1 - 1e-15)
-        fisher_info = np.sum(p_cal_clipped * (1 - p_cal_clipped))
-        se_delta_b = 1.0 / np.sqrt(fisher_info) if fisher_info > 0 else np.nan
-        
-        info['se_delta_b'] = se_delta_b
-        info['ci_lower'] = delta_b - 1.96 * se_delta_b
-        info['ci_upper'] = delta_b + 1.96 * se_delta_b
-        
-    elif method == 'prevalence':
-        # 快速近似: Δb ≈ logit(observed_prev) - logit(mean_pred)
-        obs_prev = np.clip(y_true.mean(), 1e-7, 1 - 1e-7)
-        pred_mean = np.clip(y_prob.mean(), 1e-7, 1 - 1e-7)
-        delta_b = np.log(obs_prev / (1 - obs_prev)) - np.log(pred_mean / (1 - pred_mean))
-        info['se_delta_b'] = np.nan
-    else:
-        raise ValueError(f"未知方法: {method}")
-    
-    calibrated_probs = _expit(logit_p + delta_b)
-    info['delta_b'] = delta_b
-    info['calibrated_mean_prob'] = calibrated_probs.mean()
-    
-    return delta_b, calibrated_probs, info
+    raw = str(name)
+    if raw in LABEL_MAP:
+        return LABEL_MAP[raw]
+
+    base = _strip_prefix(raw)
+    if base in LABEL_MAP:
+        return LABEL_MAP[base]
+
+    # 独热编码：从最长可匹配的前缀切分出「变量_水平」
+    for key in sorted(LABEL_MAP, key=len, reverse=True):
+        if base.startswith(key + '_'):
+            level = base[len(key) + 1:]
+            return f"{LABEL_MAP[key]}: {level}"
+
+    return base
 
 
-def _cal_slope_intercept(y_true, y_prob):
-    """计算校准斜率和截距 (logistic recalibration)"""
-    from sklearn.linear_model import LogisticRegression
-    logit_p = _safe_logit(y_prob).reshape(-1, 1)
-    lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000).fit(logit_p, y_true)
-    return lr.coef_[0][0], lr.intercept_[0]
-
-def _hosmer_lemeshow(y_true, y_prob, n_groups=10):
-    """Hosmer-Lemeshow 检验"""
-    sorted_idx = np.argsort(y_prob)
-    groups = np.array_split(sorted_idx, n_groups)
-    chi2_stat = 0
-    for g in groups:
-        if len(g) == 0: continue
-        obs_pos, exp_pos = y_true[g].sum(), y_prob[g].sum()
-        obs_neg, exp_neg = len(g) - obs_pos, len(g) - exp_pos
-        if exp_pos > 0: chi2_stat += (obs_pos - exp_pos)**2 / exp_pos
-        if exp_neg > 0: chi2_stat += (obs_neg - exp_neg)**2 / exp_neg
-    p_value = 1 - chi2.cdf(chi2_stat, n_groups - 2)
-    return chi2_stat, p_value
-
-def _integrated_calibration_index(y_true, y_prob):
-    """ICI (Austin & Steyerberg, Stat Med 2019)"""
-    from sklearn.linear_model import LogisticRegression
-    logit_p = _safe_logit(y_prob).reshape(-1, 1)
-    lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000).fit(logit_p, y_true)
-    p_smooth = lr.predict_proba(logit_p)[:, 1]
-    return np.mean(np.abs(p_smooth - y_prob))
-
-def calibration_comparison_report(y_true, prob_orig, prob_cal, label=""):
-    """打印校准前后指标对比表"""
-    report = {}
-    for tag, p in [('Original', prob_orig), ('Calibrated', prob_cal)]:
-        slope, intercept = _cal_slope_intercept(y_true, p)
-        brier = brier_score_loss(y_true, p)
-        auc_val = roc_auc_score(y_true, p)
-        eo = p.sum() / y_true.sum() if y_true.sum() > 0 else np.inf
-        hl_stat, hl_pval = _hosmer_lemeshow(y_true, p)
-        ici = _integrated_calibration_index(y_true, p)
-        report[tag] = {'AUC': auc_val, 'Brier': brier, 'Slope': slope, 
-                        'Intercept': intercept, 'E/O': eo,
-                        'H-L χ²': hl_stat, 'H-L p': hl_pval, 'ICI': ici,
-                        'Mean Pred': p.mean()}
-    
-    print(f"\n  {'─'*62}")
-    print(f"  截距校准对比 {f'({label})' if label else ''}")
-    print(f"  {'─'*62}")
-    print(f"  {'Metric':<16s} {'Original':>12s} {'Calibrated':>12s} {'Change':>12s}")
-    print(f"  {'─'*52}")
-    for m in ['AUC', 'Brier', 'Slope', 'Intercept', 'E/O', 'H-L χ²', 'H-L p', 'ICI', 'Mean Pred']:
-        v0, v1 = report['Original'][m], report['Calibrated'][m]
-        ch = v1 - v0
-        ok = ''
-        if m == 'AUC': ok = ' ✓' if abs(ch) < 0.001 else ''
-        elif m in ['Brier', 'ICI', 'H-L χ²']: ok = ' ✓' if ch < 0 else ''
-        elif m == 'Slope': ok = ' ✓' if abs(v1 - 1.0) < abs(v0 - 1.0) else ''
-        elif m == 'Intercept': ok = ' ✓' if abs(v1) < abs(v0) else ''
-        elif m == 'E/O': ok = ' ✓' if abs(v1 - 1.0) < abs(v0 - 1.0) else ''
-        elif m == 'H-L p': ok = ' ✓' if v1 > v0 else ''
-        print(f"  {m:<16s} {v0:>12.4f} {v1:>12.4f} {ch:>+12.4f}{ok}")
-    print(f"  {'─'*62}")
-    print(f"  Observed Prevalence: {y_true.mean():.2%}  |  AUC不变 = 判别力保持")
-    return report
-
-def bootstrap_delta_b_stability(y_true, y_prob, n_bootstrap=500, ci=95):
-    """Bootstrap 评估 Δb 的稳定性"""
-    delta_bs = []
-    for _ in range(n_bootstrap):
-        idx = np.random.choice(len(y_true), size=len(y_true), replace=True)
-        try:
-            db, _, _ = intercept_only_recalibration(y_true[idx], y_prob[idx], method='mle')
-            delta_bs.append(db)
-        except: continue
-    delta_bs = np.array(delta_bs)
-    alpha = (100 - ci) / 2
-    return {'mean': np.mean(delta_bs), 'std': np.std(delta_bs),
-            'ci_lower': np.percentile(delta_bs, alpha),
-            'ci_upper': np.percentile(delta_bs, 100 - alpha),
-            'n_success': len(delta_bs)}
-
-# ------------------------------------------
-# 执行截距校准
-# ------------------------------------------
-prev_int = y_int.mean()
-prev_ext = y_ext.mean()
-prev_diff = abs(prev_int - prev_ext)
-
-print(f"\n  内部集阳性率: {prev_int:.2%} ({int(y_int.sum())}/{len(y_int)})")
-print(f"  外部集阳性率: {prev_ext:.2%} ({int(y_ext.sum())}/{len(y_ext)})")
-print(f"  阳性率差异:   {prev_diff:.2%}")
-
-# --- 内部验证集校准 (训练OOF) ---
-print(f"\n  [1/4] 内部验证集截距校准...")
-delta_b_int, prob_int_cal, info_int = intercept_only_recalibration(y_int, prob_int, method='mle')
-print(f"    Δb(internal) = {delta_b_int:.4f}")
-if not np.isnan(info_int.get('se_delta_b', np.nan)):
-    print(f"    95% CI: [{info_int['ci_lower']:.4f}, {info_int['ci_upper']:.4f}]")
-
-# --- 外部验证集校准 ---
-# 策略选择: prevalence差距 > 10% → 在外部集上重新估计截距
-if prev_diff > 0.10:
-    print(f"\n  [2/4] 外部验证集截距校准 (external_update, prevalence差距 > 10%)...")
-    delta_b_ext, prob_ext_cal, info_ext = intercept_only_recalibration(y_ext, prob_ext, method='mle')
-    cal_strategy = 'external_update'
-    print(f"    Δb(external) = {delta_b_ext:.4f}")
-    if not np.isnan(info_ext.get('se_delta_b', np.nan)):
-        print(f"    95% CI: [{info_ext['ci_lower']:.4f}, {info_ext['ci_upper']:.4f}]")
-else:
-    print(f"\n  [2/4] 外部验证集截距校准 (train_then_apply, prevalence差距 ≤ 10%)...")
-    logit_ext = _safe_logit(prob_ext)
-    prob_ext_cal = _expit(logit_ext + delta_b_int)  # 用内部集的Δb
-    delta_b_ext = delta_b_int
-    cal_strategy = 'train_then_apply'
-    print(f"    使用内部集 Δb = {delta_b_int:.4f} 直接应用")
-
-# --- 校准报告 ---
-print(f"\n  [3/4] 生成校准对比报告...")
-report_int = calibration_comparison_report(y_int, prob_int, prob_int_cal, label="Internal (OOF)")
-report_ext = calibration_comparison_report(y_ext, prob_ext, prob_ext_cal, label="External")
-
-# --- Bootstrap 稳定性 ---
-print(f"\n  [4/4] Bootstrap Δb 稳定性评估 (n=500)...")
-boot_int = bootstrap_delta_b_stability(y_int, prob_int, n_bootstrap=500)
-boot_ext = bootstrap_delta_b_stability(y_ext, prob_ext, n_bootstrap=500)
-print(f"    Internal Δb: {boot_int['mean']:.4f} [{boot_int['ci_lower']:.4f}, {boot_int['ci_upper']:.4f}]")
-print(f"    External Δb: {boot_ext['mean']:.4f} [{boot_ext['ci_lower']:.4f}, {boot_ext['ci_upper']:.4f}]")
-
-# --- 保存校准后概率 ---
-df_int_cal = df_int.copy()
-df_int_cal['Pred_Prob_Calibrated'] = prob_int_cal
-df_int_cal.to_csv(f"{DATA_PATH}/Internal_Val_OOF_Preds_Calibrated_{TIMESTAMP}.csv", index=False)
-
-df_ext_cal = df_ext.copy()
-df_ext_cal['Pred_Prob_Calibrated'] = prob_ext_cal
-df_ext_cal.to_csv(f"{DATA_PATH}/External_Val_Preds_Calibrated_{TIMESTAMP}.csv", index=False)
-
-print(f"\n  ✓ 校准后概率已保存至 CSV")
-
-# --- 验证: AUC 不变 ---
-auc_int_before = roc_auc_score(y_int, prob_int)
-auc_int_after  = roc_auc_score(y_int, prob_int_cal)
-auc_ext_before = roc_auc_score(y_ext, prob_ext)
-auc_ext_after  = roc_auc_score(y_ext, prob_ext_cal)
-
-print(f"\n  ✅ AUC 验证 (应完全不变):")
-print(f"    Internal: {auc_int_before:.6f} → {auc_int_after:.6f}  Δ={auc_int_after-auc_int_before:+.6f}")
-print(f"    External: {auc_ext_before:.6f} → {auc_ext_after:.6f}  Δ={auc_ext_after-auc_ext_before:+.6f}")
-
-print(f"\n  校准策略: {cal_strategy}")
-print(f"\n{'='*60}")
-print("✅ 概率校准完成！")
-print(f"{'='*60}\n")
-
-# 将原始阈值转换到校准后的概率尺度
-from scipy.special import expit as _expit
-
-# 内部验证集的校准阈值
-clinical_threshold_cal_int = float(_expit(_safe_logit(clinical_threshold) + delta_b_int))
-
-# 外部验证集的校准阈值  
-clinical_threshold_cal_ext = float(_expit(_safe_logit(clinical_threshold) + delta_b_ext))
-
-print(f"  原始阈值:        {clinical_threshold:.4f}")
-print(f"  校准后阈值(Int): {clinical_threshold_cal_int:.4f}")
-print(f"  校准后阈值(Ext): {clinical_threshold_cal_ext:.4f}")
-
-# ==========================================
-# 3. 单模型高级分析图表 (Discriminative & Clinical)
-# ==========================================
-print(f"{'='*60}")
-print("📊 开始绘制单模型高级分析图表...")
-print(f"{'='*60}\n")
-
-# --- A. AUC 柱状图 (Internal vs External) + Bootstrap 误差棒 ---
-print("[1/4] 绘制 AUC 对比柱状图...")
-fig, ax = plt.subplots(figsize=(6, 6))
-
-# 计算 AUC
-from sklearn.metrics import roc_auc_score, auc, roc_curve
-auc_int_mean = df_cv_detail['AUC'].mean() if 'AUC' in df_cv_detail.columns else roc_auc_score(y_int, prob_int)
-auc_int_std = df_cv_detail['AUC'].std() if 'AUC' in df_cv_detail.columns else 0
-auc_ext = roc_auc_score(y_ext, prob_ext)
-
-# 从 Bootstrap 获取外部验证的置信区间
-auc_ext_ci_lower = df_bootstrap_summary.loc['AUC', '95%_CI_Lower']
-auc_ext_ci_upper = df_bootstrap_summary.loc['AUC', '95%_CI_Upper']
-auc_ext_std = df_bootstrap_summary.loc['AUC', 'Std']
-
-bars = ax.bar(['Internal (CV)', 'External'], 
-               [auc_int_mean, auc_ext], 
-               yerr=[auc_int_std, auc_ext_std], 
-               capsize=10, 
-               color=[COLOR_INTERNAL, COLOR_EXTERNAL], 
-               alpha=0.8, 
-               edgecolor='none', 
-               width=0.55)
-
-ax.set_ylim([0.6, 1.0])
-ax.set_ylabel('AUC (mean ± SD)')
-ax.set_title(f'{best_model_name}: Discrimination')
-
-# 添加数值标注
-for bar, val, ci_low, ci_up in zip(bars, 
-                                     [auc_int_mean, auc_ext], 
-                                     [auc_int_mean - 1.96*auc_int_std, auc_ext_ci_lower],
-                                     [auc_int_mean + 1.96*auc_int_std, auc_ext_ci_upper]):
-    height = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width()/2., height + 0.06, 
-            f'{val:.3f}\n({ci_low:.3f}–{ci_up:.3f})', 
-            ha='center', va='bottom', fontsize=7)
-
-plt.tight_layout()
-plt.savefig('figures/AUC_Comparison_Bar.png', dpi=DPI)
-print(f"  ✓ 已保存: figures/AUC_Comparison_Bar.png")
-plt.close()
-
-# --- A. AUC 柱状图 (Internal vs External) + Bootstrap 误差棒 + DeLong 检验 ---
-print("[1/4] 绘制 AUC 对比柱状图 (含 DeLong 检验)...")
-fig, ax = plt.subplots(figsize=(5, 5))
-
-# 计算 AUC
-from sklearn.metrics import roc_auc_score, auc, roc_curve
-auc_int_mean = df_cv_detail['AUC'].mean() if 'AUC' in df_cv_detail.columns else roc_auc_score(y_int, prob_int)
-auc_int_std = df_cv_detail['AUC'].std() if 'AUC' in df_cv_detail.columns else 0
-auc_ext = roc_auc_score(y_ext, prob_ext)
-
-# 从 Bootstrap 获取外部验证的置信区间
-auc_ext_ci_lower = df_bootstrap_summary.loc['AUC', '95%_CI_Lower']
-auc_ext_ci_upper = df_bootstrap_summary.loc['AUC', '95%_CI_Upper']
-auc_ext_std = df_bootstrap_summary.loc['AUC', 'Std']
-
-bars = ax.bar(['Internal (CV)', 'External'], 
-               [auc_int_mean, auc_ext], 
-               yerr=[auc_int_std, auc_ext_std], 
-               capsize=10, 
-               color=[COLOR_INTERNAL, COLOR_EXTERNAL], 
-               alpha=0.8, 
-               edgecolor='none', 
-               width=0.55)
-
-ax.set_ylim([0.6, 1.0])
-ax.set_ylabel('AUC (mean ± SD)')
-ax.set_title(f'{best_model_name}: Discrimination')
-
-# 添加数值标注
-for bar, val, ci_low, ci_up in zip(bars, 
-                                     [auc_int_mean, auc_ext], 
-                                     [auc_int_mean - 1.96*auc_int_std, auc_ext_ci_lower],
-                                     [auc_int_mean + 1.96*auc_int_std, auc_ext_ci_upper]):
-    height = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width()/2., height + 0.06, 
-            f'{val:.3f}\n({ci_low:.3f}–{ci_up:.3f})', 
-            ha='center', va='bottom', fontsize=7)
-
-# 添加 DeLong 检验结果
-if delong_package is not None:
-    try:
-        # 执行 DeLong 检验比较内部和外部 AUC
-        from scipy.stats import norm
-        
-        def delong_test(y_true1, y_pred1, y_true2, y_pred2):
-            """
-            DeLong 检验比较两个独立数据集的 AUC
-            返回 p-value
-            """
-            from sklearn.metrics import roc_auc_score
-            import numpy as np
-            
-            # 简化版 DeLong 检验 (使用正态近似)
-            auc1 = roc_auc_score(y_true1, y_pred1)
-            auc2 = roc_auc_score(y_true2, y_pred2)
-            
-            # 计算 AUC 的标准误
-            n1, n2 = len(y_true1), len(y_true2)
-            
-            # 使用 Hanley-McNeil 方法估计方差
-            def auc_variance(y_true, y_pred):
-                auc = roc_auc_score(y_true, y_pred)
-                n_pos = np.sum(y_true == 1)
-                n_neg = np.sum(y_true == 0)
-                
-                q1 = auc / (2 - auc)
-                q2 = 2 * auc**2 / (1 + auc)
-                
-                var = (auc * (1 - auc) + (n_pos - 1) * (q1 - auc**2) + 
-                       (n_neg - 1) * (q2 - auc**2)) / (n_pos * n_neg)
-                return var
-            
-            var1 = auc_variance(y_true1, y_pred1)
-            var2 = auc_variance(y_true2, y_pred2)
-            
-            # Z 检验
-            se = np.sqrt(var1 + var2)
-            z = (auc1 - auc2) / se
-            p_value = 2 * (1 - norm.cdf(abs(z)))
-            
-            return p_value, z
-        
-        # 执行检验
-        p_value, z_stat = delong_test(y_int, prob_int, y_ext, prob_ext)
-        
-        # 确定显著性标记
-        if p_value < 0.001:
-            sig_mark = '***'
-        elif p_value < 0.01:
-            sig_mark = '**'
-        elif p_value < 0.05:
-            sig_mark = '*'
-        else:
-            sig_mark = 'NS'
-        
-        # 在两个柱子之间添加显著性标注
-        y_max = max(auc_int_mean + 1.96*auc_int_std, auc_ext + 1.96*auc_ext_std)
-        y_sig = y_max + 0.15
-        
-        # 绘制连接线
-        ax.plot([0, 1], [y_sig, y_sig], 'k-', linewidth=1.5)
-        ax.plot([0, 0], [y_sig - 0.01, y_sig], 'k-', linewidth=1.5)
-        ax.plot([1, 1], [y_sig - 0.01, y_sig], 'k-', linewidth=1.5)
-        
-        # 在图例区域添加 p 值说明（放在左上角）
-        ax.text(0.02, 0.98, f'DeLong test: p={p_value:.4f}', 
-                transform=ax.transAxes, ha='left', va='top',
-                fontsize=8, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='none'))
-        
-        print(f"  ✓ DeLong 检验: p={p_value:.4f}, Z={z_stat:.4f}, 标记={sig_mark}")
-        
-    except Exception as e:
-        print(f"  ⚠️ DeLong 检验失败: {e}")
-
-plt.tight_layout()
-plt.savefig('figures/AUC_Comparison_Bar2.png', dpi=DPI)
-print(f"  ✓ 已保存: figures/AUC_Comparison_Bar2.png")
-plt.close()
-
-# --- B. ROC 与 PR 曲线 ---
-print("[2/4] 绘制 ROC 与 PR 曲线...")
-from sklearn.metrics import precision_recall_curve
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-
-# ROC 曲线
-for y, p, label, col in [(y_int, prob_int, 'Internal', COLOR_INTERNAL), 
-                         (y_ext, prob_ext, 'External', COLOR_EXTERNAL)]:
-    fpr, tpr, _ = roc_curve(y, p)
-    auc_score = auc(fpr, tpr)
-    axes[0].plot(fpr, tpr, color=col, lw=1.8, label=f'{label} (AUC = {auc_score:.3f})')
-
-axes[0].plot([0, 1], [0, 1], 'k--', alpha=0.4, lw=0.8)
-axes[0].set_xlabel('1 − Specificity')
-axes[0].set_ylabel('Sensitivity')
-axes[0].set_title('ROC Curve')
-sci_legend(axes[0], loc='lower right')
-
-# PR 曲线
-for y, p, label, col in [(y_int, prob_int, 'Internal', COLOR_INTERNAL), 
-                         (y_ext, prob_ext, 'External', COLOR_EXTERNAL)]:
-    prec, rec, _ = precision_recall_curve(y, p)
-    auprc = auc(rec, prec)
-    axes[1].plot(rec, prec, color=col, lw=1.8, label=f'{label} (AUPRC = {auprc:.3f})')
-
-axes[1].set_xlabel('Recall')
-axes[1].set_ylabel('Precision')
-axes[1].set_title('Precision–Recall Curve')
-sci_legend(axes[1], loc='best')
-
-plt.tight_layout()
-plt.savefig('figures/ROC_PR_Combined.png', dpi=DPI)
-print(f"  ✓ 已保存: figures/ROC_PR_Combined.png")
-plt.close()
-
-# --- C. 校准曲线 (Calibration) ---
-print("[3/4] 绘制校准曲线...")
-from sklearn.metrics import roc_auc_score, brier_score_loss
-from sklearn.calibration import calibration_curve
-from scipy.stats import chi2
-# 数据已在 Section 2 加载完毕，无需重复加载
-
-# ============================================================================
-# 校准曲线
-# ============================================================================
-
-from sklearn.linear_model import LogisticRegression
-from scipy.special import expit  # sigmoid 函数
-import warnings
-warnings.filterwarnings('ignore')
+def rename_feature_list(names):
+    """批量重命名特征列表"""
+    return [rename_feature(n) for n in names]
 
 
-# ------------------------------------------
-# 辅助函数
-# ------------------------------------------
+def rename_df_feature_col(df, col='Feature'):
+    """就地重命名 DataFrame 中的 Feature 列"""
+    if col in df.columns:
+        df[col] = df[col].map(rename_feature)
+    return df
 
+
+def rename_df_columns(df):
+    """重命名 DataFrame 的列名（用于原始特征矩阵）"""
+    return df.rename(columns={c: rename_feature(c) for c in df.columns})
+
+
+# ==========================================================
+# 一、辅助函数（校准曲线 / DCA）
+#     ❌ 已删除 intercept_only_recalibration() 与 _safe_logit()
+# ==========================================================
 def get_cali_stats(y_true, y_prob):
-    """计算校准斜率和截距"""
+    """计算校准斜率和截距（仅作为报告指标，不做任何概率修正）"""
     p_clipped = np.clip(y_prob, 1e-15, 1 - 1e-15)
     logit_p = np.log(p_clipped / (1 - p_clipped))
     X = logit_p.reshape(-1, 1)
@@ -852,19 +255,19 @@ def logistic_calibration_curve(y_true, y_prob, n_points=200):
     eps = 1e-15
     p_clipped = np.clip(y_prob, eps, 1 - eps)
     logit_p = np.log(p_clipped / (1 - p_clipped))
-    
+
     # 拟合 logistic recalibration: P(Y=1) = sigmoid(a * logit(p) + b)
     lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000)
     lr.fit(logit_p.reshape(-1, 1), y_true)
-    
+
     slope = lr.coef_[0][0]
     intercept = lr.intercept_[0]
-    
+
     # 生成平滑曲线
     x_range = np.linspace(y_prob.min(), min(y_prob.max(), 0.95), n_points)
     x_logit = np.log(np.clip(x_range, eps, 1-eps) / (1 - np.clip(x_range, eps, 1-eps)))
     y_fit = expit(slope * x_logit + intercept)
-    
+
     return x_range, y_fit, slope, intercept
 
 
@@ -876,35 +279,32 @@ def adaptive_calibration_bins(y_true, y_prob, min_samples=20, max_bins=10):
     - 返回 bin 统计信息
     """
     n = len(y_true)
-    # 初始bin数: 确保每bin有足够样本
     n_bins = min(max_bins, max(5, n // (min_samples * 2)))
-    
-    # 等频分位数
+
     quantiles = np.linspace(0, 100, n_bins + 1)
     bin_edges = np.unique(np.percentile(y_prob, quantiles))
-    
+
     results = {'pred': [], 'true': [], 'n': [], 'n_pos': [],
                'ci_low': [], 'ci_up': [], 'pred_range': []}
-    
+
     for i in range(len(bin_edges) - 1):
         if i == len(bin_edges) - 2:
             mask = (y_prob >= bin_edges[i]) & (y_prob <= bin_edges[i+1])
         else:
             mask = (y_prob >= bin_edges[i]) & (y_prob < bin_edges[i+1])
-        
+
         n_in = mask.sum()
-        if n_in < max(5, min_samples // 2):  # 最低门槛
+        if n_in < max(5, min_samples // 2):
             continue
-        
+
         p_hat = y_true[mask].mean()
         mean_pred = y_prob[mask].mean()
-        
-        # Wilson 置信区间
+
         z = 1.96
         denom = 1 + z**2 / n_in
         center = (p_hat + z**2 / (2 * n_in)) / denom
         spread = z * np.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * n_in)) / n_in) / denom
-        
+
         results['pred'].append(mean_pred)
         results['true'].append(p_hat)
         results['n'].append(n_in)
@@ -912,40 +312,38 @@ def adaptive_calibration_bins(y_true, y_prob, min_samples=20, max_bins=10):
         results['ci_low'].append(max(0, center - spread))
         results['ci_up'].append(min(1, center + spread))
         results['pred_range'].append((bin_edges[i], bin_edges[min(i+1, len(bin_edges)-1)]))
-    
+
     for k in results:
         results[k] = np.array(results[k]) if k != 'pred_range' else results[k]
-    
+
     return results
 
 
 def bootstrap_logistic_cal_ci(y_true, y_prob, n_bootstrap=1000, ci=95):
-    """
-    Bootstrap 置信带 (基于 logistic recalibration 拟合线)
-    """
+    """Bootstrap 置信带 (基于 logistic recalibration 拟合线)"""
     eps = 1e-15
     x_range = np.linspace(max(y_prob.min(), 0.001), min(y_prob.max(), 0.95), 200)
     x_logit = np.log(np.clip(x_range, eps, 1-eps) / (1 - np.clip(x_range, eps, 1-eps)))
-    
+
     boot_curves = []
     for _ in range(n_bootstrap):
         idx = np.random.choice(len(y_true), size=len(y_true), replace=True)
         y_b, p_b = y_true[idx], y_prob[idx]
-        
+
         try:
             logit_b = np.log(np.clip(p_b, eps, 1-eps) / (1 - np.clip(p_b, eps, 1-eps)))
             lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=500)
             lr.fit(logit_b.reshape(-1, 1), y_b)
             y_fit = expit(lr.coef_[0][0] * x_logit + lr.intercept_[0])
             boot_curves.append(y_fit)
-        except:
+        except Exception:
             continue
-    
+
     boot_curves = np.array(boot_curves)
     alpha = (100 - ci) / 2
     lower = np.percentile(boot_curves, alpha, axis=0)
     upper = np.percentile(boot_curves, 100 - alpha, axis=0)
-    
+
     return x_range, lower, upper
 
 
@@ -953,7 +351,7 @@ def hosmer_lemeshow_test(y_true, y_prob, n_groups=10):
     """Hosmer-Lemeshow 拟合优度检验 (标准十分位数法)"""
     sorted_idx = np.argsort(y_prob)
     groups = np.array_split(sorted_idx, n_groups)
-    
+
     chi2_stat = 0
     for g in groups:
         if len(g) == 0:
@@ -966,320 +364,17 @@ def hosmer_lemeshow_test(y_true, y_prob, n_groups=10):
             chi2_stat += (obs_pos - exp_pos) ** 2 / exp_pos
         if exp_neg > 0:
             chi2_stat += (obs_neg - exp_neg) ** 2 / exp_neg
-    
+
     p_value = 1 - chi2.cdf(chi2_stat, n_groups - 2)
     return chi2_stat, p_value
 
-
-# ============================================================================
-# 主绘图函数
-# ============================================================================
-C_INT      = COLORS_LIST[3]   # #3C5488 深蓝 — 内部验证
-C_EXT      = COLORS_LIST[0]   # #E64B35 红色 — 外部验证
-C_CORRECT  = COLORS_LIST[2]   # #00A087 绿色 — Optimism-Corrected
-C_OOF_LINE = COLORS_LIST[1]   # #4DBBD5 青色 — OOF 原始曲线
-C_EXT_LINE = COLORS_LIST[7]   # #DC0000 深红 — 外部原始曲线
-C_APPARENT = COLORS_LIST[5]   # #8491B4 灰蓝 — Apparent
-C_BRIER    = COLORS_LIST[4]   # #F39B7F 珊瑚橙 — Brier / 第三指标
-
-def plot_calibration_publication(
-    y_int, prob_int, y_ext, prob_ext,
-    save_path='figures/Calibration_Publication.png',
-    dpi=600, n_bootstrap=1000
-):
-
-
-    # ==================== 布局: 主图 + 底部spike图 ====================
-    fig = plt.figure(figsize=(3.5, 4.5))
-    gs = gridspec.GridSpec(
-        2, 1, height_ratios=[5.5, 1], hspace=0.05,
-        left=0.12, right=0.95, top=0.93, bottom=0.08
-    )
-
-    ax_main = fig.add_subplot(gs[0])
-    ax_spike = fig.add_subplot(gs[1], sharex=ax_main)
-
-    # ==================== 数据集配置 (与 ROC_CI 同色) ====================
-    datasets = [
-        {'y': y_int, 'prob': prob_int, 'label': 'Internal',
-         'color': C_INT, 'fill': C_INT, 'marker': 'o'},
-        {'y': y_ext, 'prob': prob_ext, 'label': 'External',
-         'color': C_EXT, 'fill': C_EXT, 'marker': 's'},
-    ]
-
-    print("\n" + "="*70)
-    print("  Publication-Quality Calibration Plot")
-    print("="*70)
-
-    stats_lines = []
-
-    for ds in datasets:
-        y, p = ds['y'], ds['prob']
-
-        # --- A. 统计量 ---
-        slope, intercept = get_cali_stats(y, p)
-        hl_stat, hl_pval = hosmer_lemeshow_test(y, p, n_groups=10)
-        brier = brier_score_loss(y, p)
-        eo_ratio = p.sum() / y.sum() if y.sum() > 0 else np.inf
-
-        sig = '***' if hl_pval < 0.001 else ('**' if hl_pval < 0.01 else ('*' if hl_pval < 0.05 else ''))
-
-        print(f"\n  {ds['label']}:")
-        print(f"    N={len(y)}, Events={int(y.sum())} ({y.mean():.1%})")
-        print(f"    Slope={slope:.3f}, Intercept={intercept:.3f}")
-        print(f"    Brier={brier:.4f}, E/O={eo_ratio:.3f}")
-        print(f"    H-L: χ²={hl_stat:.2f}, p={hl_pval:.4f}")
-
-        # --- B. 自适应分bin ---
-        min_per_bin = max(15, int(len(y) * 0.04))
-        bins = adaptive_calibration_bins(y, p, min_samples=min_per_bin, max_bins=10)
-
-        # 点大小编码样本量 — 缩小至与 3.5in 画幅匹配的比例
-        size_min, size_max = 15, 45
-        if len(bins['n']) > 0 and bins['n'].max() > bins['n'].min():
-            sizes = size_min + (size_max - size_min) * (bins['n'] - bins['n'].min()) / (bins['n'].max() - bins['n'].min())
-        else:
-            sizes = np.full(len(bins['n']), (size_min + size_max) / 2)
-
-        # 误差线 — 细化线宽 & cap, 与曲线 lw=1.5 协调
-        ax_main.errorbar(
-            bins['pred'], bins['true'],
-            yerr=[bins['true'] - bins['ci_low'], bins['ci_up'] - bins['true']],
-            fmt='none', ecolor=ds['color'], elinewidth=0.6,
-            capsize=1.5, capthick=0.6, alpha=0.45, zorder=3
-        )
-
-        # 散点 — 缩小尺寸, 细化描边
-        ax_main.scatter(
-            bins['pred'], bins['true'], s=sizes, marker=ds['marker'],
-            facecolors=ds['color'], edgecolors=ds['color'],
-            linewidths=0.7, alpha=0.85, zorder=4
-        )
-
-        # --- C. Logistic recalibration 拟合曲线 (带 label 供图例使用) ---
-        x_fit, y_fit, _, _ = logistic_calibration_curve(y, p)
-        ax_main.plot(x_fit, y_fit, color=ds['color'], lw=1.5,
-                     alpha=0.8, zorder=5, label=ds['label'])
-
-        # --- D. Bootstrap CI 带 ---
-        print(f"    Computing {n_bootstrap} bootstrap CIs...")
-        x_ci, ci_low, ci_up = bootstrap_logistic_cal_ci(y, p, n_bootstrap=n_bootstrap)
-        ax_main.fill_between(x_ci, ci_low, ci_up, color=ds['color'],
-                             alpha=0.15, zorder=1)
-
-        # --- E. 统计信息 ---
-        hl_p_str = 'p < 0.001' if hl_pval < 0.001 else f'p = {hl_pval:.3f}'
-        stats_lines.append(
-            f"{ds['label']}: Slope = {slope:.2f}, Int = {intercept:.2f}, "
-            f"Brier = {brier:.3f}"
-        )
-        stats_lines.append(
-            f"  H-L χ² = {hl_stat:.2f}, {hl_p_str}{sig}, "
-            f"E/O = {eo_ratio:.2f}"
-        )
-
-    # --- F. 理想校准线 ---
-    ax_main.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--',
-                 zorder=2, label='Ideal')
-
-    # ==================== 主图美化 (与 ROC_CI 一致) ====================
-    ax_main.set_xlabel('Predicted probability')
-    ax_main.set_ylabel('Observed proportion')
-    ax_main.set_xlim([-0.02, 1.02])
-    ax_main.set_ylim([-0.02, 1.02])
-    ax_main.set_aspect('equal')
-    ax_main.tick_params(axis='x', labelbottom=False)
-    ax_main.spines['top'].set_visible(False)
-    ax_main.spines['right'].set_visible(False)
-
-    # ---- 图例 → upper left, 避免与右下角统计框重叠 ----
-    sci_legend(ax_main, loc='upper left')
-
-    # ---- 统计信息框 → lower right, 与 ROC_CI 图例框同风格 ----
-    stats_text = '\n'.join(stats_lines)
-    ax_main.text(
-        0.98, 0.03, stats_text,
-        transform=ax_main.transAxes,
-        fontsize=5.5, va='bottom', ha='right',
-        bbox=dict(
-            boxstyle='round,pad=0.4',
-            facecolor='white',
-            alpha=0.92,
-            edgecolor='#808080',
-            linewidth=0.8
-        )
-    )
-
-    # ==================== 底部 Spike Histogram ====================
-    spike_bins = np.linspace(0, 1, 41)
-    bin_width = spike_bins[1] - spike_bins[0]
-
-    for ds in datasets:
-        y, p = ds['y'], ds['prob']
-        offset = 0.002 if ds['marker'] == 'o' else -0.002
-
-        counts_pos, _ = np.histogram(p[y == 1], bins=spike_bins)
-        centers = (spike_bins[:-1] + spike_bins[1:]) / 2 + offset
-        ax_spike.bar(centers, counts_pos, width=bin_width * 0.45,
-                     color=ds['color'], alpha=0.6, edgecolor='none')
-
-        counts_neg, _ = np.histogram(p[y == 0], bins=spike_bins)
-        neg_scale = max(counts_pos.max(), 1) / max(counts_neg.max(), 1) * 0.8
-        ax_spike.bar(centers, -counts_neg * neg_scale, width=bin_width * 0.45,
-                     color=ds['color'], alpha=0.25, edgecolor='none')
-
-    ax_spike.axhline(y=0, color='#888888', linewidth=0.6)
-    ax_spike.set_xlabel('Predicted probability')
-    ax_spike.set_xlim([-0.02, 1.02])
-    ax_spike.spines['top'].set_visible(False)
-    ax_spike.spines['right'].set_visible(False)
-    ax_spike.set_yticks([])
-
-    ax_spike.text(0.01, 0.92, 'Events', transform=ax_spike.transAxes,
-                  fontsize=6.5, color='#555555', va='top', fontstyle='italic')
-    ax_spike.text(0.01, 0.08, 'Non-events', transform=ax_spike.transAxes,
-                  fontsize=6.5, color='#555555', va='bottom', fontstyle='italic')
-
-    # ==================== 保存 ====================
-    plt.savefig(save_path, dpi=dpi, bbox_inches='tight',
-                facecolor='white', edgecolor='none')
-    pdf_path = save_path.rsplit('.', 1)[0] + '.pdf'
-    plt.savefig(pdf_path, bbox_inches='tight')
-    print(f"\n  ✓ Saved: {save_path} / .pdf")
-    plt.close()
-    return fig
-
-
-# ============================================================================
-# 补充图: 诊断面板
-# ============================================================================
-def plot_calibration_diagnostic(
-    y_int, prob_int, y_ext, prob_ext,
-    save_path='figures/Calibration_Diagnostic.png',
-    dpi=600
-):
-
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    # ============ Panel A: 概率分布 ============
-    ax = axes[0]
-    bin_edges = np.linspace(0, 1, 51)
-
-    for y, p, label, col in [(y_int, prob_int, 'Internal', C_INT),
-                              (y_ext, prob_ext, 'External', C_EXT)]:
-        ax.hist(p[y == 0], bins=bin_edges, density=True, alpha=0.15,
-                color=col, label=f'{label} - Non-events')
-        ax.hist(p[y == 1], bins=bin_edges, density=True, alpha=0.6,
-                color=col, histtype='step', lw=1.5,
-                label=f'{label} - Events')
-
-    # 标注"概率沙漠"
-    ax.axvspan(0.3, 0.6, alpha=0.08, color='orange', zorder=0)
-    ax.text(0.45, ax.get_ylim()[1] * 0.85, 'Sparse\nZone', ha='center',
-            fontsize=10, color='darkorange', fontstyle='italic')
-
-    ax.set_xlabel('Predicted probability')
-    ax.set_ylabel('Density')
-    ax.set_title('A. Probability distribution', fontsize=13, loc='left')
-    sci_legend(ax, loc='upper right')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    # ============ Panel B: 各区间样本量和阳性率 ============
-    ax = axes[1]
-
-    edges = [0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]
-    x_pos = np.arange(len(edges) - 1)
-    bar_width = 0.35
-
-    for idx, (y, p, label, col) in enumerate([
-        (y_int, prob_int, 'Internal', C_INT),
-        (y_ext, prob_ext, 'External', C_EXT)
-    ]):
-        n_bins_list = []
-        pos_rate_list = []
-        for i in range(len(edges) - 1):
-            mask = (p >= edges[i]) & (p < edges[i+1]) if i < len(edges)-2 else \
-                   (p >= edges[i]) & (p <= edges[i+1])
-            n_in = mask.sum()
-            pos_rate = y[mask].mean() if n_in > 0 else 0
-            n_bins_list.append(n_in)
-            pos_rate_list.append(pos_rate)
-
-        offset = -bar_width/2 + idx * bar_width
-        bars = ax.bar(x_pos + offset, n_bins_list, bar_width,
-                      color=col, alpha=0.6, label=f'{label} (n)')
-
-        for j, (bar, pr, n) in enumerate(zip(bars, pos_rate_list, n_bins_list)):
-            if n > 0:
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-                        f'{pr:.0%}', ha='center', va='bottom', fontsize=7,
-                        color=col)
-
-    tick_labels = [f'{edges[i]:.0%}-{edges[i+1]:.0%}' for i in range(len(edges)-1)]
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8.5)
-    ax.set_xlabel('Probability range')
-    ax.set_ylabel('n')
-    ax.set_title('B. Sample size per bin', fontsize=13, loc='left')
-    sci_legend(ax)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    # ============ Panel C: 校准曲线 + 样本量标注 ============
-    ax = axes[2]
-
-    for y, p, label, col, marker in [
-        (y_int, prob_int, 'Internal', C_INT, 'o'),
-        (y_ext, prob_ext, 'External', C_EXT, 's')
-    ]:
-        slope, intercept = get_cali_stats(y, p)
-        min_per_bin = max(15, int(len(y) * 0.04))
-        bins = adaptive_calibration_bins(y, p, min_samples=min_per_bin, max_bins=10)
-
-        # 拟合曲线
-        x_fit, y_fit, _, _ = logistic_calibration_curve(y, p)
-        ax.plot(x_fit, y_fit, color=col, lw=1.5, alpha=0.7)
-
-        # 散点 + 误差线
-        ax.errorbar(bins['pred'], bins['true'],
-                    yerr=[bins['true'] - bins['ci_low'], bins['ci_up'] - bins['true']],
-                    fmt='none', ecolor=col, elinewidth=1.0, capsize=2.5, alpha=0.4)
-        ax.scatter(bins['pred'], bins['true'], s=80, marker=marker,
-                   facecolors='white', edgecolors=col, linewidths=1.5, alpha=0.9,
-                   label=f'{label} (Slope={slope:.2f})')
-
-        # 标注每个点的样本量
-        for xp, yp, n in zip(bins['pred'], bins['true'], bins['n']):
-            ax.annotate(f'n={int(n)}', (xp, yp), fontsize=6.5, color=col,
-                        textcoords='offset points', xytext=(5, 5), alpha=0.7)
-
-    ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-    ax.set_xlabel('Predicted probability')
-    ax.set_ylabel('Observed proportion')
-    ax.set_title('C. Calibration with n', fontsize=13, loc='left')
-    ax.set_xlim([-0.02, 1.02])
-    ax.set_ylim([-0.02, 1.02])
-    ax.set_aspect('equal')
-    sci_legend(ax, loc='upper left')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=dpi, bbox_inches='tight',
-                facecolor='white', edgecolor='none')
-    pdf_path = save_path.rsplit('.', 1)[0] + '.pdf'
-    plt.savefig(pdf_path, bbox_inches='tight')
-    print(f"\n  ✓ Saved: {save_path} / .pdf")
-    plt.close()
-    return fig
 
 def plot_calibration_publication_v2(
     y_int, prob_int, y_ext, prob_ext,
     save_path='figures/Calibration_Publication_v2.png',
     dpi=600, n_bootstrap=1000
 ):
+    """出版级校准曲线（直接使用原始预测概率，不做任何截距校准）"""
 
     # ==================== 布局: 主图 + 底部spike图 ====================
     fig = plt.figure(figsize=(3.5, 3.5))
@@ -1377,7 +472,7 @@ def plot_calibration_publication_v2(
     ax_main.spines['right'].set_visible(False)
 
     # ---- 图例 (含全部统计信息, 放在 lower right) ----
-    sci_legend(ax_main, loc='lower right', fontsize=5.5)
+    sci_legend(ax_main, loc='lower right', fontsize=7)
 
     # ==================== 底部 Spike Histogram ====================
     spike_bins = np.linspace(0, 1, 41)
@@ -1417,344 +512,628 @@ def plot_calibration_publication_v2(
     print(f"\n  ✓ Saved: {save_path} / .pdf")
     plt.close()
     return fig
-# ============================================================================
-# 执行
-# ============================================================================
-os.makedirs('figures', exist_ok=True)
 
-# 图1:  校准后概率
-print("\n[1/5] Publication calibration plot (After Intercept Calibration)...")
-plot_calibration_publication_v2(
-    y_int, prob_int_cal, y_ext, prob_ext_cal,
-    save_path=f'figures/Calibration_Publication_v2_Calibrated_{TIMESTAMP}.png',
-    n_bootstrap=1000
-)
-
-# 图2: 诊断面板 
-print("\n[2/5] Diagnostic panel (After Calibration)...")
-plot_calibration_diagnostic(
-    y_int, prob_int_cal, y_ext, prob_ext_cal,
-    save_path=f'figures/Calibration_Diagnostic_Calibrated_{TIMESTAMP}.png'
-)
-
-
-# 图3: 诊断面板 - 校准前后对比
-print("\n[3/5] Diagnostic panel (Before vs After Comparison)...")
-def plot_calibration_diagnostic_comparison(
-    y_int, prob_int_orig, prob_int_cal, y_ext, prob_ext_orig, prob_ext_cal,
-    save_path=None, dpi=600
-):
-
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-
-    for row_idx, (pi, pe, row_label) in enumerate([
-        (prob_int_orig, prob_ext_orig, 'Before calibration'),
-        (prob_int_cal, prob_ext_cal, 'After Calibration')
-    ]):
-        # Panel A: 概率分布
-        ax = axes[row_idx, 0]
-        bin_edges = np.linspace(0, 1, 51)
-        for y, p, label, col in [(y_int, pi, 'Internal', C_INT),
-                                  (y_ext, pe, 'External', C_EXT)]:
-            ax.hist(p[y == 0], bins=bin_edges, density=True, alpha=0.15,
-                    color=col, label=f'{label} - Non-events')
-            ax.hist(p[y == 1], bins=bin_edges, density=True, alpha=0.6,
-                    color=col, histtype='step', lw=1.5,
-                    label=f'{label} - Events')
-        ax.set_xlabel('Predicted probability')
-        ax.set_ylabel('Density')
-        ax.set_title(f'A{row_idx+1}. Probability Distribution ({row_label})', fontsize=12,
-                     loc='left')
-        sci_legend(ax, loc='upper right')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-        # Panel B: 各区间样本量
-        ax = axes[row_idx, 1]
-        edges = [0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]
-        x_pos = np.arange(len(edges) - 1)
-        bar_width = 0.35
-        for idx2, (y, p, label, col) in enumerate([
-            (y_int, pi, 'Internal', C_INT),
-            (y_ext, pe, 'External', C_EXT)
-        ]):
-            n_bins_list = []
-            pos_rate_list = []
-            for i in range(len(edges) - 1):
-                mask = (p >= edges[i]) & (p < edges[i+1]) if i < len(edges)-2 else \
-                       (p >= edges[i]) & (p <= edges[i+1])
-                n_in = mask.sum()
-                pos_rate = y[mask].mean() if n_in > 0 else 0
-                n_bins_list.append(n_in)
-                pos_rate_list.append(pos_rate)
-            offset = -bar_width/2 + idx2 * bar_width
-            bars = ax.bar(x_pos + offset, n_bins_list, bar_width,
-                          color=col, alpha=0.6, label=f'{label} (n)')
-            for j, (bar, pr, n) in enumerate(zip(bars, pos_rate_list, n_bins_list)):
-                if n > 0:
-                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-                            f'{pr:.0%}', ha='center', va='bottom', fontsize=6,
-                            color=col)
-        tick_labels = [f'{edges[i]:.0%}-{edges[i+1]:.0%}' for i in range(len(edges)-1)]
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=7.5)
-        ax.set_xlabel('Probability range')
-        ax.set_ylabel('n')
-        ax.set_title(f'B{row_idx+1}. Sample Size ({row_label})', fontsize=12, loc='left')
-        sci_legend(ax)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-        # Panel C: 校准曲线
-        ax = axes[row_idx, 2]
-        for y, p, label, col, marker in [
-            (y_int, pi, 'Internal', C_INT, 'o'),
-            (y_ext, pe, 'External', C_EXT, 's')
-        ]:
-            slope, intercept = get_cali_stats(y, p)
-            min_per_bin = max(15, int(len(y) * 0.04))
-            bins = adaptive_calibration_bins(y, p, min_samples=min_per_bin, max_bins=10)
-            x_fit, y_fit, _, _ = logistic_calibration_curve(y, p)
-            ax.plot(x_fit, y_fit, color=col, lw=1.5, alpha=0.7)
-            ax.errorbar(bins['pred'], bins['true'],
-                        yerr=[bins['true'] - bins['ci_low'], bins['ci_up'] - bins['true']],
-                        fmt='none', ecolor=col, elinewidth=1.0, capsize=2.5, alpha=0.4)
-            ax.scatter(bins['pred'], bins['true'], s=80, marker=marker,
-                       facecolors='white', edgecolors=col, linewidths=1.5, alpha=0.9,
-                       label=f'{label} (Slope={slope:.2f})')
-        ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-        ax.set_xlabel('Predicted probability')
-        ax.set_ylabel('Observed proportion')
-        ax.set_title(f'C{row_idx+1}. Calibration ({row_label})', fontsize=12, loc='left')
-        ax.set_xlim([-0.02, 1.02])
-        ax.set_ylim([-0.02, 1.02])
-        ax.set_aspect('equal')
-        sci_legend(ax, loc='upper left')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-    plt.suptitle('Calibration Diagnostic: Before vs After Intercept-Only Recalibration',
-                 fontsize=15, y=1.01)
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
-        pdf_path = save_path.rsplit('.', 1)[0] + '.pdf'
-        plt.savefig(pdf_path, bbox_inches='tight')
-        print(f"  ✓ Saved: {save_path} / .pdf")
-    plt.close()
-
-plot_calibration_diagnostic_comparison(
-    y_int, prob_int, prob_int_cal, y_ext, prob_ext, prob_ext_cal,
-    save_path=f'figures/Calibration_Diagnostic_BeforeAfter_{TIMESTAMP}.png'
-)
-
-# 图4: 校准前后叠加对比图
-print("\n[4/4] Before vs After overlay plot (External)...")
-
-def plot_calibration_before_after_overlay(
-    y_true, prob_orig, prob_cal, label_set="External",
-    save_path=None, dpi=600, n_bootstrap=500
-):
-
-    import matplotlib.gridspec as gridspec
-    from matplotlib.lines import Line2D
-
-    COLOR_ORIG = '#7B2D8B'     # 深紫 - 校准前主线
-    COLOR_CAL = '#1B7837'      # 深绿 - 校准后主线
-
-    fig = plt.figure(figsize=(8, 9.5))
-    gs = gridspec.GridSpec(2, 1, height_ratios=[5.5, 1], hspace=0.05,
-                           left=0.12, right=0.95, top=0.93, bottom=0.08)
-    ax_main = fig.add_subplot(gs[0])
-    ax_spike = fig.add_subplot(gs[1], sharex=ax_main)
-
-    datasets = [
-        {'p': prob_orig, 'label': 'Before calibration',
-         'color': COLOR_ORIG, 'marker': 's'},
-        {'p': prob_cal, 'label': 'After calibration',
-         'color': COLOR_CAL, 'marker': 'o'},
-    ]
-
-    stats_lines = []
-
-    for ds in datasets:
-        p = ds['p']
-        slope, intercept = get_cali_stats(y_true, p)
-        brier = brier_score_loss(y_true, p)
-        hl_stat, hl_pval = hosmer_lemeshow_test(y_true, p, n_groups=10)
-        eo = p.sum() / y_true.sum() if y_true.sum() > 0 else np.inf
-
-        # 自适应分bin
-        min_per_bin = max(15, int(len(y_true) * 0.04))
-        bins = adaptive_calibration_bins(y_true, p, min_samples=min_per_bin, max_bins=10)
-
-        if len(bins['pred']) > 0:
-            sizes = np.full(len(bins['n']), 80)
-            if len(bins['n']) > 1 and bins['n'].max() > bins['n'].min():
-                sizes = 50 + 130 * (bins['n'] - bins['n'].min()) / (bins['n'].max() - bins['n'].min())
-
-            ax_main.errorbar(bins['pred'], bins['true'],
-                             yerr=[bins['true'] - bins['ci_low'], bins['ci_up'] - bins['true']],
-                             fmt='none', ecolor=ds['color'], elinewidth=1.0, capsize=3, alpha=0.4, zorder=3)
-            ax_main.scatter(bins['pred'], bins['true'], s=sizes, marker=ds['marker'],
-                            facecolors=ds['color'], edgecolors=ds['color'],
-                            linewidths=1.3, alpha=0.85, zorder=4)
-
-        # Logistic recalibration 拟合线
-        x_fit, y_fit, _, _ = logistic_calibration_curve(y_true, p)
-        ax_main.plot(x_fit, y_fit, color=ds['color'], lw=1.5, alpha=0.8, zorder=5)
-
-        # Bootstrap CI
-        x_ci, ci_low, ci_up = bootstrap_logistic_cal_ci(y_true, p, n_bootstrap=n_bootstrap)
-        ax_main.fill_between(x_ci, ci_low, ci_up, color=ds['color'], alpha=0.15, zorder=1)
-
-        sig = '***' if hl_pval < 0.001 else ('**' if hl_pval < 0.01 else ('*' if hl_pval < 0.05 else ''))
-        stats_lines.append(
-            f"{ds['label']}: Slope={slope:.2f}, Int={intercept:.2f}, Brier={brier:.3f}"
-        )
-        stats_lines.append(
-            f"  H-L: χ²={hl_stat:.2f}, p={'<0.001' if hl_pval < 0.001 else f'{hl_pval:.3f}'}{sig}, E/O={eo:.2f}"
-        )
-
-    # 对角线
-    ax_main.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--', zorder=2)
-
-    # 美化主图
-    ax_main.set_ylabel('Observed proportion')
-    ax_main.set_xlim([-0.02, 1.02])
-    ax_main.set_ylim([-0.02, 1.02])
-    ax_main.set_aspect('equal')
-    ax_main.tick_params(axis='x', labelbottom=False)
-    ax_main.spines['top'].set_visible(False)
-    ax_main.spines['right'].set_visible(False)
-
-    sci_legend(ax_main, loc='upper left')
-
-    stats_text = '\n'.join(stats_lines)
-    ax_main.text(0.98, 0.04, stats_text, transform=ax_main.transAxes,
-                 fontsize=7.5, va='bottom', ha='right', fontfamily='monospace',
-                 bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
-                           alpha=0.88, edgecolor='#cccccc'))
-
-    # Spike histogram
-    spike_bins_arr = np.linspace(0, 1, 41)
-    bin_w = spike_bins_arr[1] - spike_bins_arr[0]
-    for ds_p, col, offset in [(prob_orig, COLOR_ORIG, 0.002), (prob_cal, COLOR_CAL, -0.002)]:
-        counts_pos, _ = np.histogram(ds_p[y_true == 1], bins=spike_bins_arr)
-        counts_neg, _ = np.histogram(ds_p[y_true == 0], bins=spike_bins_arr)
-        centers = (spike_bins_arr[:-1] + spike_bins_arr[1:]) / 2 + offset
-        ax_spike.bar(centers, counts_pos, width=bin_w * 0.42, color=col, alpha=0.6, edgecolor='none')
-        neg_scale = max(counts_pos.max(), 1) / max(counts_neg.max(), 1) * 0.8
-        ax_spike.bar(centers, -counts_neg * neg_scale, width=bin_w * 0.42, color=col, alpha=0.25, edgecolor='none')
-
-    ax_spike.axhline(y=0, color='#888888', linewidth=0.6)
-    ax_spike.set_xlabel('Predicted probability')
-    ax_spike.set_xlim([-0.02, 1.02])
-    ax_spike.spines['top'].set_visible(False)
-    ax_spike.spines['right'].set_visible(False)
-    ax_spike.set_yticks([])
-    ax_spike.text(0.01, 0.92, 'Events', transform=ax_spike.transAxes,
-                  fontsize=8.5, color='#555555', va='top', fontstyle='italic')
-    ax_spike.text(0.01, 0.08, 'Non-events', transform=ax_spike.transAxes,
-                  fontsize=8.5, color='#555555', va='bottom', fontstyle='italic')
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white')
-        pdf_path = save_path.rsplit('.', 1)[0] + '.pdf'
-        plt.savefig(pdf_path, bbox_inches='tight')
-        print(f"  ✓ Saved: {save_path} / .pdf")
-    plt.close()
-
-# 外部验证集 before vs after
-plot_calibration_before_after_overlay(
-    y_ext, prob_ext, prob_ext_cal, label_set="External",
-    save_path=f'figures/Calibration_BeforeAfter_External_{TIMESTAMP}.png',
-    n_bootstrap=500
-)
-
-# 内部验证集 before vs after
-plot_calibration_before_after_overlay(
-    y_int, prob_int, prob_int_cal, label_set="Internal (OOF)",
-    save_path=f'figures/Calibration_BeforeAfter_Internal_{TIMESTAMP}.png',
-    n_bootstrap=500
-)
-
-print("\n✅ All calibration plots generated!")
-
-# ============================================================================
-# 3. DCA 决策曲线分析（使用 OOF 数据 + 截距校准对比）
-# ============================================================================
-print("\n" + "="*80)
-print("[3/3] 绘制决策曲线分析（原始 + 校准后概率对比）")
-print("="*80)
 
 def calculate_net_benefit(y_true, y_pred_prob, threshold):
     """计算净获益"""
     if threshold >= 1.0:
         return 0
-    
+
     n = len(y_true)
     tp = np.sum((y_pred_prob >= threshold) & (y_true == 1))
     fp = np.sum((y_pred_prob >= threshold) & (y_true == 0))
-    
+
     net_benefit = (tp / n) - (fp / n) * (threshold / (1 - threshold))
     return net_benefit
+
 
 def bootstrap_net_benefit(y_true, y_pred_prob, thresholds, n_bootstrap=500):
     """使用 Bootstrap 计算净获益的置信区间"""
     from sklearn.utils import resample
-    
+
     all_nbs = []
     for _ in range(n_bootstrap):
         indices = resample(np.arange(len(y_true)), random_state=None)
         y_boot = y_true[indices]
         p_boot = y_pred_prob[indices]
-        
+
         nbs = [calculate_net_benefit(y_boot, p_boot, t) for t in thresholds]
         all_nbs.append(nbs)
-    
+
     all_nbs = np.array(all_nbs)
     lower = np.percentile(all_nbs, 2.5, axis=0)
     upper = np.percentile(all_nbs, 97.5, axis=0)
     mean = np.mean(all_nbs, axis=0)
-    
+
     return mean, lower, upper
 
+
 def calculate_n_high_risk(y_pred_prob, threshold, n_total):
-    """计算高风险患者数量"""
-    return np.sum(y_pred_prob >= threshold) / n_total * 1000  # 每1000人
+    """计算高风险患者数量（每 1000 人）"""
+    return np.sum(y_pred_prob >= threshold) / n_total * 1000
 
-# 设置阈值范围
+
+# ==========================================================
+# 二、数据加载
+#   ✅ 完全对齐建模脚本 Model_Package_<TS>.pkl 的实际字段：
+#      best_model / best_model_name / optimal_threshold / preprocessor /
+#      X_train / y_train / X_external / y_external /
+#      predictions{train_probs, external_probs, internal_oof_probs} /
+#      cv_results / final_metrics / bootstrap_analysis / risk_stratification
+#   ⚠️ 建模脚本已明确 'calibrated_model': None —— 本脚本同样不做任何校准。
+# ==========================================================
+print("=" * 60)
+print("📂 加载模型与预测数据 ...")
+print("=" * 60)
+
+pkl_path = f"{DATA_PATH}/Model_Package_{TIMESTAMP}.pkl"
+if not os.path.exists(pkl_path):
+    raise FileNotFoundError(f"❌ 找不到模型包: {pkl_path}")
+full_package = joblib.load(pkl_path)
+
+# ---------- 2.1 模型与阈值 ----------
+best_model        = full_package['best_model']
+best_model_name   = full_package['best_model_name']
+optimal_threshold = full_package['optimal_threshold']      # 原始概率尺度上的锁定阈值
+clinical_threshold = optimal_threshold
+preprocessor      = full_package.get('preprocessor', None)
+
+assert full_package.get('calibrated_model', None) is None, \
+    "⚠️ 模型包中存在 calibrated_model；本脚本按未校准流程设计，请确认。"
+
+# ---------- 2.2 原始（未标准化）特征表 ----------
+#   SHAP 眼轴长依赖图需要 mm 尺度的 AL，必须来自这里
+X_TRAIN_RAW = full_package.get('X_train',    None)
+Y_TRAIN     = full_package.get('y_train',    None)
+X_EXT_RAW   = full_package.get('X_external', None)
+Y_EXT_PKG   = full_package.get('y_external', None)
+if X_TRAIN_RAW is not None:
+    print(f"  ✓ 原始训练集特征表: {X_TRAIN_RAW.shape}")
+    print(f"  ✓ 原始外部集特征表: {X_EXT_RAW.shape}")
+else:
+    print("  ⚠️ 模型包中无原始特征表，SHAP 依赖图将退回标准化尺度")
+
+# ---------- 2.3 真实标签（CSV）与预测概率（pickle 原始浮点为准）----------
+df_int = pd.read_csv(f"{DATA_PATH}/Internal_Val_OOF_Preds_{best_model_name}_{TIMESTAMP}.csv")
+df_ext = pd.read_csv(f"{DATA_PATH}/External_Val_Preds_{best_model_name}_{TIMESTAMP}.csv")
+y_int = df_int['True_Label'].values
+y_ext = df_ext['True_Label'].values
+
+preds_dict = full_package['predictions']
+prob_int = np.asarray(preds_dict['internal_oof_probs'], dtype=float)   # p_dev_oof
+prob_ext = np.asarray(preds_dict['external_probs'],     dtype=float)   # p_external_locked
+
+assert len(df_int) == len(prob_int), "❌ 内部验证长度不一致"
+assert len(df_ext) == len(prob_ext), "❌ 外部验证长度不一致"
+
+# 一致性核查（CSV 浮点截断导致的微小差异可接受）
+_ok_int = np.allclose(df_int['Pred_Prob'].values, prob_int, rtol=1e-4, atol=1e-5)
+_ok_ext = np.allclose(df_ext['Pred_Prob'].values, prob_ext, rtol=1e-4, atol=1e-5)
+if _ok_int and _ok_ext:
+    print("  ✅ CSV 与 Pickle 预测概率一致")
+else:
+    print("  ⚠️ CSV 与 Pickle 概率存在微小差异（浮点截断），以 Pickle 为准")
+
+# ---------- 2.4 外部 Bootstrap（曲线置信带 + 指标 95% CI）----------
+_boot_pkl = f"{DATA_PATH}/Bootstrap_Predictions_{TIMESTAMP}.pkl"
+if os.path.exists(_boot_pkl):
+    bootstrap_predictions = joblib.load(_boot_pkl)
+else:                                   # 回退：模型包内也存了一份
+    bootstrap_predictions = full_package['bootstrap_analysis']['predictions']
+    print("  ℹ️ 未找到 Bootstrap_Predictions pkl，改用模型包内嵌的 bootstrap 预测")
+
+#   混淆矩阵指标表引用的外部 95% CI（Sensitivity / Specificity / PPV / NPV /
+#   F1 / MCC / G_mean / Balanced_Acc），优先用 CSV，其次用模型包内的 summary
+df_bootstrap_ext = None
+_boot_csv = f"{DATA_PATH}/External_Val_Bootstrap_1000_{TIMESTAMP}.csv"
+try:
+    if os.path.exists(_boot_csv):
+        df_bootstrap_ext = pd.read_csv(_boot_csv, index_col=0)
+    elif 'bootstrap_analysis' in full_package:
+        df_bootstrap_ext = pd.DataFrame(full_package['bootstrap_analysis']['summary']).T
+    if df_bootstrap_ext is not None:
+        print(f"  ✓ 外部 Bootstrap 指标表: {len(df_bootstrap_ext)} 个指标（含 95% CI）")
+except Exception as e:
+    print(f"  ⚠️ 外部 Bootstrap 指标表加载失败: {e}")
+
+# ---------- 2.5 阈值方法（仅供打印溯源）----------
+threshold_method = 'Unknown'
+if 'cv_results' in full_package and best_model_name in full_package['cv_results']:
+    threshold_method = full_package['cv_results'][best_model_name].get(
+        'threshold_method', 'Unknown')
+
+prev_int = y_int.mean()
+prev_ext = y_ext.mean()
+
+print(f"  ✓ 最佳模型: {best_model_name}")
+print(f"  ✓ 内部验证 (OOF): {len(prob_int)} 例，结局率 {prev_int:.1%}")
+print(f"  ✓ 外部验证:        {len(prob_ext)} 例，结局率 {prev_ext:.1%}")
+print(f"  ✓ 锁定阈值 (原始尺度): {clinical_threshold:.4f}（方法: {threshold_method}）")
+print(f"  ✓ 外部 bootstrap 重采样: {len(bootstrap_predictions)} 次")
+print("  ℹ️ 本脚本已删除截距校准，所有分析均基于原始预测概率。")
+
+
+# ==========================================================
+# 三、Bootstrap 曲线与置信带
+#   内部：对 (y_int, prob_int) 做患者层面 bootstrap 重采样（OOF band）
+#   外部：直接用预存的 bootstrap_predictions（locked external band）
+#   —— 不做任何模型重拟合
+# ==========================================================
+print("\n" + "=" * 60)
+print("📈 计算 Bootstrap 曲线与 95% 置信带 ...")
+print("=" * 60)
+
+mean_fpr    = np.linspace(0, 1, 100)
+mean_recall = np.linspace(0, 1, 100)
+N_BOOT = 1000                      # 内外部保持一致
+np.random.seed(42)                 # 复现性
+
+# --- 点估计（确定性，决定主线与图例数字）---
+oof_auc = roc_auc_score(y_int, prob_int)
+oof_ap  = average_precision_score(y_int, prob_int)
+ext_auc = roc_auc_score(y_ext, prob_ext)
+ext_ap  = average_precision_score(y_ext, prob_ext)
+print(f"  内部 OOF : AUROC = {oof_auc:.3f} | AP = {oof_ap:.3f}")
+print(f"  外部     : AUROC = {ext_auc:.3f} | AP = {ext_ap:.3f}")
+
+# --- 内部 OOF bootstrap 重采样 ---
+boot_tprs_oof, boot_precs_oof = [], []
+boot_auc_oof,  boot_ap_oof    = [], []        # ← 新增：AUROC / AP 的 bootstrap 分布
+for _ in range(N_BOOT):
+    idx = np.random.choice(len(y_int), size=len(y_int), replace=True)
+    yb, pb = y_int[idx], prob_int[idx]
+    if len(np.unique(yb)) < 2:
+        continue
+    fpr_b, tpr_b, _ = roc_curve(yb, pb)
+    it = np.interp(mean_fpr, fpr_b, tpr_b); it[0] = 0.0
+    boot_tprs_oof.append(it)
+    prec_b, rec_b, _ = precision_recall_curve(yb, pb)
+    order = np.argsort(rec_b)
+    boot_precs_oof.append(np.interp(mean_recall, rec_b[order], prec_b[order]))
+    boot_auc_oof.append(roc_auc_score(yb, pb))                # ← 新增
+    boot_ap_oof.append(average_precision_score(yb, pb))       # ← 新增
+
+boot_tprs_oof  = np.array(boot_tprs_oof)
+boot_precs_oof = np.array(boot_precs_oof)
+mean_tpr_oof  = boot_tprs_oof.mean(axis=0)
+std_tpr_oof   = boot_tprs_oof.std(axis=0)
+upper_tpr_oof = np.minimum(mean_tpr_oof + 1.96 * std_tpr_oof, 1)
+lower_tpr_oof = np.maximum(mean_tpr_oof - 1.96 * std_tpr_oof, 0)
+mean_prec_oof  = boot_precs_oof.mean(axis=0)
+std_prec_oof   = boot_precs_oof.std(axis=0)
+upper_prec_oof = np.minimum(mean_prec_oof + 1.96 * std_prec_oof, 1)
+lower_prec_oof = np.maximum(mean_prec_oof - 1.96 * std_prec_oof, 0)
+
+# --- 外部 bootstrap（预存重采样预测）---
+tprs_external, precs_external = [], []
+boot_auc_ext,  boot_ap_ext    = [], []        # ← 新增：AUROC / AP 的 bootstrap 分布
+for boot_pred in bootstrap_predictions:
+    y_true_b = boot_pred['true_labels']
+    y_pred_b = boot_pred['pred_probs']
+    if len(np.unique(y_true_b)) < 2:
+        continue
+    fpr_e, tpr_e, _ = roc_curve(y_true_b, y_pred_b)
+    it = np.interp(mean_fpr, fpr_e, tpr_e); it[0] = 0.0
+    tprs_external.append(it)
+    prec_e, rec_e, _ = precision_recall_curve(y_true_b, y_pred_b)
+    order = np.argsort(rec_e)
+    precs_external.append(np.interp(mean_recall, rec_e[order], prec_e[order]))
+    boot_auc_ext.append(roc_auc_score(y_true_b, y_pred_b))            # ← 新增
+    boot_ap_ext.append(average_precision_score(y_true_b, y_pred_b))   # ← 新增
+
+tprs_external  = np.array(tprs_external)
+precs_external = np.array(precs_external)
+mean_tpr_ext  = tprs_external.mean(axis=0)
+std_tpr_ext   = tprs_external.std(axis=0)
+upper_tpr_ext = np.minimum(mean_tpr_ext + 1.96 * std_tpr_ext, 1)
+lower_tpr_ext = np.maximum(mean_tpr_ext - 1.96 * std_tpr_ext, 0)
+mean_prec_ext  = precs_external.mean(axis=0)
+std_prec_ext   = precs_external.std(axis=0)
+upper_prec_ext = np.minimum(mean_prec_ext + 1.96 * std_prec_ext, 1)
+lower_prec_ext = np.maximum(mean_prec_ext - 1.96 * std_prec_ext, 0)
+
+# --- 经验（原始）曲线：内部 OOF / 外部 locked ---
+fpr_oof_orig, tpr_oof_orig, _ = roc_curve(y_int, prob_int)
+fpr_ext_orig, tpr_ext_orig, _ = roc_curve(y_ext, prob_ext)
+prec_oof_orig, rec_oof_orig, _ = precision_recall_curve(y_int, prob_int)
+prec_ext_orig, rec_ext_orig, _ = precision_recall_curve(y_ext, prob_ext)
+
+prevalence_int = y_int.mean()
+prevalence_ext = y_ext.mean()
+print(f"  ✓ band 完成（内部 n_boot={len(boot_tprs_oof)}，外部 n_boot={len(tprs_external)}）")
+
+
+# --- AUROC / AP 的 95% 百分位 CI，以及 Δ(External − Internal) ---
+#     用于「内部 × 外部叠加图」的图例与标题；不改变任何点估计。
+_RNG_COMB = np.random.RandomState(2026)   # 独立随机流，避免扰动上游 np.random.seed(42)
+
+
+def _pct_ci(samples, lo=2.5, hi=97.5):
+    """bootstrap 分布的百分位 95% CI；样本过少时返回 nan（图例自动省略 CI）"""
+    s = np.asarray(samples, dtype=float)
+    s = s[np.isfinite(s)]
+    if s.size < 20:
+        return np.array([np.nan, np.nan])
+    return np.percentile(s, [lo, hi])
+
+
+def _delta_ci(samples_int, samples_ext, n_pair=4000):
+    """内部与外部是相互独立的两个队列（非配对），因此直接对两组 bootstrap
+    分布做随机配对求差，得到 Δ(External − Internal) 的经验 95% CI。
+    返回 (Δ 的 bootstrap 均值, [CI 下限, CI 上限])。"""
+    a = np.asarray(samples_int, dtype=float); a = a[np.isfinite(a)]
+    b = np.asarray(samples_ext, dtype=float); b = b[np.isfinite(b)]
+    if a.size < 20 or b.size < 20:
+        return np.nan, np.array([np.nan, np.nan])
+    d = b[_RNG_COMB.randint(0, b.size, n_pair)] - a[_RNG_COMB.randint(0, a.size, n_pair)]
+    return float(np.mean(d)), np.percentile(d, [2.5, 97.5])
+
+
+auc_int_ci = _pct_ci(boot_auc_oof)
+auc_ext_ci = _pct_ci(boot_auc_ext)
+ap_int_ci  = _pct_ci(boot_ap_oof)
+ap_ext_ci  = _pct_ci(boot_ap_ext)
+
+delta_auc = ext_auc - oof_auc              # 点估计之差（图中显示的 Δ）
+delta_ap  = ext_ap  - oof_ap
+_, d_auc_ci = _delta_ci(boot_auc_oof, boot_auc_ext)
+_, d_ap_ci  = _delta_ci(boot_ap_oof,  boot_ap_ext)
+
+print(f"  内部 : AUROC = {oof_auc:.3f} ({auc_int_ci[0]:.3f}–{auc_int_ci[1]:.3f}) | "
+      f"AP = {oof_ap:.3f} ({ap_int_ci[0]:.3f}–{ap_int_ci[1]:.3f})")
+print(f"  外部 : AUROC = {ext_auc:.3f} ({auc_ext_ci[0]:.3f}–{auc_ext_ci[1]:.3f}) | "
+      f"AP = {ext_ap:.3f} ({ap_ext_ci[0]:.3f}–{ap_ext_ci[1]:.3f})")
+print(f"  Δ(Ext − Int): AUROC = {delta_auc:+.3f} ({d_auc_ci[0]:+.3f} to {d_auc_ci[1]:+.3f}) | "
+      f"AP = {delta_ap:+.3f} ({d_ap_ci[0]:+.3f} to {d_ap_ci[1]:+.3f})")
+
+
+# ==========================================================
+# 四、正文六图 A–F
+# ==========================================================
+FIG_SINGLE = (3.6, 3.6)    # 单图（ROC / PR），与校准图 3.5×3.5 尺度一致
+
+print("\n" + "=" * 60)
+print("🎨 生成正文图 ...")
+print("=" * 60)
+print("\n[A] ROC — Internal (OOF) 单图 ...")
+# ==================== 图 A：ROC Internal（单图）====================
+fig, ax = plt.subplots(figsize=FIG_SINGLE)
+ax.fill_between(mean_fpr, lower_tpr_oof, upper_tpr_oof, color=C_INT, alpha=0.15,
+                label='95% Bootstrap CI')
+ax.plot(fpr_oof_orig, tpr_oof_orig, color=C_INT, lw=1.5,
+        label=f'OOF (AUROC = {oof_auc:.3f})')
+ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
+ax.set_xlabel('1 − Specificity')
+ax.set_ylabel('Sensitivity')
+ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+ax.set_aspect('equal')
+sci_legend(ax, loc='lower right')
+plt.tight_layout()
+plt.savefig('figures/ROC_Internal.png', dpi=600, bbox_inches='tight')
+plt.savefig('figures/ROC_Internal.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/ROC_Internal.png / .pdf")
+plt.close()
+
+print("\n[B] ROC — External (locked) 单图 ...")
+# ==================== 图 B：ROC External（单图）====================
+fig, ax = plt.subplots(figsize=FIG_SINGLE)
+ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext, color=C_EXT, alpha=0.15,
+                label='95% Bootstrap CI')
+ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT, lw=1.5,
+        label=f'External (AUROC = {ext_auc:.3f})')
+ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
+ax.set_xlabel('1 − Specificity')
+ax.set_ylabel('Sensitivity')
+ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+ax.set_aspect('equal')
+sci_legend(ax, loc='lower right')
+plt.tight_layout()
+plt.savefig('figures/ROC_External.png', dpi=600, bbox_inches='tight')
+plt.savefig('figures/ROC_External.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/ROC_External.png / .pdf")
+plt.close()
+
+print("\n[C] PR — Internal (OOF) 单图 ...")
+# ==================== 图 C：PR Internal（单图）====================
+fig, ax = plt.subplots(figsize=FIG_SINGLE)
+ax.fill_between(mean_recall, lower_prec_oof, upper_prec_oof, color=C_INT, alpha=0.15,
+                label='95% Bootstrap CI')
+ax.plot(rec_oof_orig, prec_oof_orig, color=C_INT, lw=1.5,
+        label=f'OOF (AP = {oof_ap:.3f})')
+ax.axhline(y=prevalence_int, color='#999999', ls=':', lw=0.8,
+           label=f'Prevalence = {prevalence_int:.3f}')
+ax.set_xlabel('Recall')
+ax.set_ylabel('Precision')
+ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
+sci_legend(ax, loc='upper right')
+plt.tight_layout()
+plt.savefig('figures/PR_Internal.png', dpi=600, bbox_inches='tight')
+plt.savefig('figures/PR_Internal.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/PR_Internal.png / .pdf")
+plt.close()
+
+print("\n[D] PR — External (locked) 单图 ...")
+# ==================== 图 D：PR External（单图）====================
+fig, ax = plt.subplots(figsize=FIG_SINGLE)
+ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext, color=C_EXT, alpha=0.15,
+                label='95% Bootstrap CI')
+ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT, lw=1.5,
+        label=f'External (AP = {ext_ap:.3f})')
+ax.axhline(y=prevalence_ext, color='#999999', ls=':', lw=0.8,
+           label=f'Prevalence = {prevalence_ext:.3f}')
+ax.set_xlabel('Recall')
+ax.set_ylabel('Precision')
+ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
+sci_legend(ax, loc='upper right')
+plt.tight_layout()
+plt.savefig('figures/PR_External.png', dpi=600, bbox_inches='tight')
+plt.savefig('figures/PR_External.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/PR_External.png / .pdf")
+plt.close()
+
+
+# ==========================================================
+# 四补、图 A+B / 图 C+D —— 内部 × 外部「同图叠加」可视化（新增）
+#   · 图 A+B → figures/ROC_Internal_vs_External.(png|pdf)
+#   · 图 C+D → figures/PR_Internal_vs_External.(png|pdf)
+#
+#   设计要点（与单图 A–D 完全同源，正文数字保证一致）：
+#     - 主线：内部 = OOF 经验曲线（蓝 C_INT），外部 = locked 经验曲线（红 C_EXT）；
+#     - 阴影：各自的 95% bootstrap 置信带，alpha 调低以免双带互相压色；
+#     - 图例：AUROC / AP 点估计 + 95% 百分位 CI；
+#             队列 n 与事件数默认【不】显示（COMB_SHOW_N=False），请在图注中补充；
+#     - 标题：Δ(External − Internal) 及其非配对 bootstrap 95% CI
+#             （跨 0 → 内外部表现差异无统计学意义）；
+#     - 工作点：锁定阈值 clinical_threshold 在两条曲线上的位置（空心圆）。
+#   全部开关见下方 COMB_* 常量，按需一键关闭。
+# ==========================================================
+COMB_FIGSIZE      = (4.0, 4.0)   # 叠加图信息量更大，较单图 3.6×3.6 略放大
+COMB_SHOW_BAND    = True         # 是否绘制 95% bootstrap 置信带
+COMB_SHOW_OP      = False        # 是否标注锁定阈值工作点
+COMB_SHOW_CI_TEXT = True         # 图例中是否附 95% CI
+COMB_SHOW_DELTA   = False        # 图例标题是否显示 Δ(External − Internal)
+COMB_SHOW_N       = False        # 图例中是否标注各队列 n 与事件数（关闭 → 单行图例）
+COMB_LS_INT       = '-'          # 内部线型
+COMB_LS_EXT       = '-'          # 外部线型（如需黑白友好，可改为 '--'）
+COMB_ALPHA_BAND   = 0.13         # 置信带透明度
+
+#   队列在图例中的显示名（同时用于数值表 Cohort 列，保证图表口径一致）
+COMB_NAME_INT     = 'Internal (OOF)'   # 若正文不想出现 OOF，改成 'Internal'
+COMB_NAME_EXT     = 'External'         # 按要求去掉原来的 '(locked)'
+
+#   图例位置：可选 'lower right' / 'upper right' / 'lower left' / 'upper left' /
+#            'below'（轴下方）/ 'right'（轴右侧）
+#   · ROC 曲线恒在对角线上方 → 右下角必为空白，图例放图内最省版面；
+#   · PR 曲线形状随患病率与模型强弱变化，图内任何角落都可能被曲线/置信带压住，
+#     故默认放到坐标轴下方，保证不遮挡；若两图需并排作为同一张图的 a/b 面板、
+#     希望高度完全一致，把下面两个都设成 'below' 即可。
+COMB_LEGEND_ROC   = 'lower right'
+COMB_LEGEND_PR    = 'upper right'
+
+_LEGEND_POS_MAP = {
+    'lower right': dict(loc='lower right'),
+    'upper right': dict(loc='upper right'),
+    'lower left':  dict(loc='lower left'),
+    'upper left':  dict(loc='upper left'),
+    'below':       dict(loc='upper center', bbox_to_anchor=(0.5, -0.16)),
+    'right':       dict(loc='upper left',   bbox_to_anchor=(1.02, 1.0)),
+}
+
+
+def _u_minus(s):
+    """ASCII 连字符 → 排版负号 U+2212（与坐标轴 '1 − Specificity' 风格统一）"""
+    return s.replace('-', '\u2212')
+
+
+def _fmt_metric(name, point, ci):
+    """图例正文：'AUROC = 0.812 (0.751–0.869)'"""
+    if COMB_SHOW_CI_TEXT and np.all(np.isfinite(ci)):
+        return f'{name} = {point:.3f} ({ci[0]:.3f}–{ci[1]:.3f})'
+    return f'{name} = {point:.3f}'
+
+
+def _cohort_label(cohort_name, y, metric_name, point, ci):
+    """图例条目：
+         COMB_SHOW_N=False → 'External: AUROC = 0.812 (0.751–0.869)'（单行）
+         COMB_SHOW_N=True  → 'External: n = 412, 58 events\\nAUROC = 0.812 (...)'"""
+    metric = _fmt_metric(metric_name, point, ci)
+    if COMB_SHOW_N:
+        return f'{cohort_name}: n = {len(y)}, {int(y.sum())} events\n{metric}'
+    return f'{cohort_name}: {metric}'
+
+
+def _fmt_delta(name, point, ci):
+    """图例标题：'ΔAUROC (Ext − Int) = +0.021 (−0.048 to +0.091)'"""
+    if not COMB_SHOW_DELTA:
+        return None
+    if np.all(np.isfinite(ci)):
+        return _u_minus(f'Δ{name} (Ext - Int) = {point:+.3f} '
+                        f'({ci[0]:+.3f} to {ci[1]:+.3f})')
+    return _u_minus(f'Δ{name} (Ext - Int) = {point:+.3f}')
+
+
+def _op_point(y_true, y_prob, threshold, kind='roc'):
+    """锁定阈值下的工作点：ROC → (1 − Spec, Sens)；PR → (Recall, Precision)"""
+    y_pred = (np.asarray(y_prob) >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    prec = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+    return (1 - spec, sens) if kind == 'roc' else (sens, prec)
+
+
+def _comb_legend(ax, extra_handles, pos, title=None):
+    """统一图例：曲线句柄 + 置信带/工作点/患病率代理句柄，文字左对齐；
+    pos 见 _LEGEND_POS_MAP（图内四角 / 轴下方 / 轴右侧）
+    单行标签时收紧 labelspacing，避免图例过于松散"""
+    h, l = ax.get_legend_handles_labels()
+    h = list(h) + list(extra_handles)
+    l = list(l) + [a.get_label() for a in extra_handles]
+    kw = dict(_LEGEND_POS_MAP.get(pos, _LEGEND_POS_MAP['lower right']))
+    leg = sci_legend(ax, handles=h, labels=l, fontsize=6.5,
+                     title=title, title_fontsize=6.5, borderpad=0.45,
+                     labelspacing=(0.5 if COMB_SHOW_N else 0.35),
+                     handlelength=1.6, handletextpad=0.5, **kw)
+    try:                                   # 旧版 matplotlib 无 alignment 参数
+        leg._legend_box.align = 'left'
+    except Exception:
+        pass
+    return leg
+
+
+def _band_handle():
+    return mpl.patches.Patch(facecolor='#9E9E9E', edgecolor='none', alpha=0.35,
+                             label='95% bootstrap CI')
+
+
+def _op_handle():
+    return Line2D([], [], marker='o', ms=4.5, mfc='white', mec='#4D4D4D', mew=1.3,
+                  ls='none', label=f'Locked threshold = {clinical_threshold:.3f}')
+
+
+# ==================== 图 A+B：ROC Internal vs External ====================
+print("\n[A+B] ROC — Internal vs External（叠加）...")
+fig, ax = plt.subplots(figsize=COMB_FIGSIZE)
+
+ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--', zorder=1)
+
+if COMB_SHOW_BAND:
+    ax.fill_between(mean_fpr, lower_tpr_oof, upper_tpr_oof,
+                    color=C_INT, alpha=COMB_ALPHA_BAND, lw=0, zorder=2)
+    ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext,
+                    color=C_EXT, alpha=COMB_ALPHA_BAND, lw=0, zorder=2)
+
+ax.plot(fpr_oof_orig, tpr_oof_orig, color=C_INT, lw=1.6, ls=COMB_LS_INT, zorder=4,
+        label=_cohort_label(COMB_NAME_INT, y_int, 'AUROC', oof_auc, auc_int_ci))
+ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT, lw=1.6, ls=COMB_LS_EXT, zorder=4,
+        label=_cohort_label(COMB_NAME_EXT, y_ext, 'AUROC', ext_auc, auc_ext_ci))
+
+_extra = [_band_handle()] if COMB_SHOW_BAND else []
+if COMB_SHOW_OP:
+    for _y, _p, _c in [(y_int, prob_int, C_INT), (y_ext, prob_ext, C_EXT)]:
+        _x0, _y0 = _op_point(_y, _p, clinical_threshold, kind='roc')
+        ax.plot([_x0], [_y0], marker='o', ms=4.5, mfc='white', mec=_c, mew=1.3,
+                ls='none', zorder=6)
+    _extra.append(_op_handle())
+
+ax.set_xlabel('1 − Specificity')
+ax.set_ylabel('Sensitivity')
+ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+ax.set_aspect('equal')
+_comb_legend(ax, _extra, COMB_LEGEND_ROC,
+             title=_fmt_delta('AUROC', delta_auc, d_auc_ci))
+plt.tight_layout()
+plt.savefig('figures/ROC_Internal_vs_External.png', dpi=DPI, bbox_inches='tight')
+plt.savefig('figures/ROC_Internal_vs_External.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/ROC_Internal_vs_External.png / .pdf")
+plt.close()
+
+
+# ==================== 图 C+D：PR Internal vs External ====================
+print("\n[C+D] PR — Internal vs External（叠加）...")
+fig, ax = plt.subplots(figsize=COMB_FIGSIZE)
+
+if COMB_SHOW_BAND:
+    ax.fill_between(mean_recall, lower_prec_oof, upper_prec_oof,
+                    color=C_INT, alpha=COMB_ALPHA_BAND, lw=0, zorder=2)
+    ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext,
+                    color=C_EXT, alpha=COMB_ALPHA_BAND, lw=0, zorder=2)
+
+# 各队列的事件率基线（PR 曲线的“随机”参考线，随患病率变化）
+ax.axhline(prevalence_int, color=C_INT, ls=':', lw=0.9, alpha=0.75, zorder=3)
+ax.axhline(prevalence_ext, color=C_EXT, ls=':', lw=0.9, alpha=0.75, zorder=3)
+
+ax.plot(rec_oof_orig, prec_oof_orig, color=C_INT, lw=1.6, ls=COMB_LS_INT, zorder=4,
+        label=_cohort_label(COMB_NAME_INT, y_int, 'AP', oof_ap, ap_int_ci))
+ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT, lw=1.6, ls=COMB_LS_EXT, zorder=4,
+        label=_cohort_label(COMB_NAME_EXT, y_ext, 'AP', ext_ap, ap_ext_ci))
+
+_extra = [_band_handle()] if COMB_SHOW_BAND else []
+_extra.append(Line2D([], [], color='#4D4D4D', ls=':', lw=0.9,
+                     label=(f'Prevalence: Int {prevalence_int:.3f} / '
+                            f'Ext {prevalence_ext:.3f}')))
+if COMB_SHOW_OP:
+    for _y, _p, _c in [(y_int, prob_int, C_INT), (y_ext, prob_ext, C_EXT)]:
+        _x0, _y0 = _op_point(_y, _p, clinical_threshold, kind='pr')
+        ax.plot([_x0], [_y0], marker='o', ms=4.5, mfc='white', mec=_c, mew=1.3,
+                ls='none', zorder=6)
+    _extra.append(_op_handle())
+
+ax.set_xlabel('Recall (Sensitivity)')
+ax.set_ylabel('Precision (PPV)')
+ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
+_comb_legend(ax, _extra, COMB_LEGEND_PR,
+             title=_fmt_delta('AP', delta_ap, d_ap_ci))
+plt.tight_layout()
+plt.savefig('figures/PR_Internal_vs_External.png', dpi=DPI, bbox_inches='tight')
+plt.savefig('figures/PR_Internal_vs_External.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/PR_Internal_vs_External.png / .pdf")
+plt.close()
+
+
+# ---------- 叠加图对应的数值表（便于正文/审稿直接引用）----------
+# 注：图例已不再显示 n 与事件数，此表仍保留 N / Events 两列，信息不丢失
+try:
+    _sens_i, _prec_i = _op_point(y_int, prob_int, clinical_threshold, kind='pr')
+    _sens_e, _prec_e = _op_point(y_ext, prob_ext, clinical_threshold, kind='pr')
+    _fpr_i, _ = _op_point(y_int, prob_int, clinical_threshold, kind='roc')
+    _fpr_e, _ = _op_point(y_ext, prob_ext, clinical_threshold, kind='roc')
+    _comb_tbl = pd.DataFrame([
+        {'Cohort': COMB_NAME_INT, 'N': len(y_int), 'Events': int(y_int.sum()),
+         'Prevalence': prevalence_int,
+         'AUROC': oof_auc, 'AUROC_CI_low': auc_int_ci[0], 'AUROC_CI_high': auc_int_ci[1],
+         'AP': oof_ap, 'AP_CI_low': ap_int_ci[0], 'AP_CI_high': ap_int_ci[1],
+         'Threshold': clinical_threshold, 'Sensitivity_at_thr': _sens_i,
+         'Specificity_at_thr': 1 - _fpr_i, 'Precision_at_thr': _prec_i},
+        {'Cohort': COMB_NAME_EXT, 'N': len(y_ext), 'Events': int(y_ext.sum()),
+         'Prevalence': prevalence_ext,
+         'AUROC': ext_auc, 'AUROC_CI_low': auc_ext_ci[0], 'AUROC_CI_high': auc_ext_ci[1],
+         'AP': ext_ap, 'AP_CI_low': ap_ext_ci[0], 'AP_CI_high': ap_ext_ci[1],
+         'Threshold': clinical_threshold, 'Sensitivity_at_thr': _sens_e,
+         'Specificity_at_thr': 1 - _fpr_e, 'Precision_at_thr': _prec_e},
+        {'Cohort': 'Δ (External − Internal)', 'N': np.nan, 'Events': np.nan,
+         'Prevalence': prevalence_ext - prevalence_int,
+         'AUROC': delta_auc, 'AUROC_CI_low': d_auc_ci[0], 'AUROC_CI_high': d_auc_ci[1],
+         'AP': delta_ap, 'AP_CI_low': d_ap_ci[0], 'AP_CI_high': d_ap_ci[1],
+         'Threshold': clinical_threshold, 'Sensitivity_at_thr': _sens_e - _sens_i,
+         'Specificity_at_thr': _fpr_i - _fpr_e, 'Precision_at_thr': _prec_e - _prec_i},
+    ])
+    _comb_csv = 'figures/ROC_PR_Internal_vs_External_Metrics.csv'
+    _comb_tbl.to_csv(_comb_csv, index=False, encoding='utf-8-sig')
+    print(f"  ✓ 已保存: {_comb_csv}")
+except Exception as e:
+    print(f"  ⚠️ 叠加图数值表导出失败: {e}")
+
+
+    
+
+
+# ==================== 面板 E：校准曲线（原始概率）====================
+print("\n[E] 校准曲线（原始预测概率，无截距校准）...")
+plot_calibration_publication_v2(
+    y_int, prob_int, y_ext, prob_ext,
+    save_path=f'figures/Calibration_Publication_v2_{TIMESTAMP}.png',
+    n_bootstrap=1000
+)
+
+
+# ==================== 面板 F：决策曲线分析（原始概率）====================
+print("\n[F] 决策曲线分析（原始预测概率，无截距校准）...")
+
+# Treat-all 基线（各自结局率）与阈值网格
 threshs = np.arange(0, 1.01, 0.01)
-
-# 获取最优阈值（从模型包中）
-optimal_threshold = full_package.get('optimal_threshold', 0.5)
-
-# ============================================================================
-# DCA 图1: 原始概率 DCA 
-# ============================================================================
-print("\n  [DCA 1/3] 原始概率 DCA... ")
-
-# 计算 Treat All 基线 — 使用各自数据集的患病率 (而非混合)
-prevalence_int = np.sum(y_int == 1) / len(y_int)
-prevalence_ext = np.sum(y_ext == 1) / len(y_ext)
 all_nb_int = prevalence_int - (1 - prevalence_int) * (threshs / (1 - threshs + 1e-10))
 all_nb_ext = prevalence_ext - (1 - prevalence_ext) * (threshs / (1 - threshs + 1e-10))
 
-# ============================================================================
-# DCA 图2: 校准后概率 DCA (内外部对比)
-# ============================================================================
-print("\n  [DCA 2/3] 校准后概率 DCA...")
 fig = plt.figure(figsize=(3.5, 5))
 gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 0.5], hspace=0.3)
 ax_main = fig.add_subplot(gs[0])
 ax_num = fig.add_subplot(gs[1], sharex=ax_main)
 
-dca_data_cal = {}
+dca_data = {}
 
-for y, p, label, col in [(y_int, prob_int_cal, 'Internal (calibrated)', C_INT),
-                          (y_ext, prob_ext_cal, 'External (calibrated)', C_EXT)]:
+for y, p, label, col in [(y_int, prob_int, 'Internal', C_INT),
+                         (y_ext, prob_ext, 'External', C_EXT)]:
     try:
         nbs_mean, nbs_lower, nbs_upper = bootstrap_net_benefit(y, p, threshs, n_bootstrap=500)
     except Exception as e:
@@ -1769,7 +1148,7 @@ for y, p, label, col in [(y_int, prob_int_cal, 'Internal (calibrated)', C_INT),
     n_high_risk = [calculate_n_high_risk(p, t, len(y)) for t in threshs]
     ax_num.plot(threshs, n_high_risk, color=col, lw=1.5, alpha=0.8)
 
-    dca_data_cal[label] = {
+    dca_data[label] = {
         'net_benefit': nbs_mean, 'ci_lower': nbs_lower,
         'ci_upper': nbs_upper, 'n_high_risk': n_high_risk
     }
@@ -1780,341 +1159,69 @@ ax_main.plot(threshs, all_nb_int, color=C_INT, ls='--', lw=1.0,
 ax_main.plot(threshs, all_nb_ext, color=C_EXT, ls='--', lw=1.0,
              alpha=0.45, label=f'Treat all Ext ({prevalence_ext:.1%})')
 ax_main.axhline(y=0, color='black', lw=0.8, ls='-.', label='Treat none', alpha=0.7)
-ax_main.axvline(clinical_threshold_cal_int, color=C_INT, ls=':', lw=1.0,
-                alpha=0.5, label=f'Threshold Int = {clinical_threshold_cal_int:.3f}')
-ax_main.axvline(clinical_threshold_cal_ext, color=C_EXT, ls=':', lw=1.0,
-                alpha=0.5, label=f'Threshold Ext = {clinical_threshold_cal_ext:.3f}')
+ax_main.axvline(clinical_threshold, color='#333333', ls='--', lw=1.2,
+                alpha=0.9, label=f'Locked threshold = {clinical_threshold:.3f}')
 ax_main.set_xlim([0, 0.5])
-y_max_candidates_cal = [all_nb_int.max(), all_nb_ext.max()]
-for k in dca_data_cal:
-    y_max_candidates_cal.append(max(dca_data_cal[k]['net_benefit']))
-y_max_cal = max(y_max_candidates_cal)
-ax_main.set_ylim([-0.05, y_max_cal + 0.05])
+y_max_candidates = [all_nb_int.max(), all_nb_ext.max()]
+for k in dca_data:
+    y_max_candidates.append(max(dca_data[k]['net_benefit']))
+y_max = max(y_max_candidates)
+ax_main.set_ylim([-0.05, y_max + 0.05])
 ax_main.set_ylabel('Net benefit')
 ax_main.tick_params(axis='x', labelbottom=False)          # 主面板隐藏x标签
 ax_main.spines['top'].set_visible(False)
 ax_main.spines['right'].set_visible(False)
-sci_legend(ax_main, loc='upper right', fontsize=5.5,
-           handlelength=1.8, handletextpad=0.5,
-           labelspacing=0.35, borderpad=0.4)
-
-ax_num.set_ylabel('High risk\nper 1000', fontsize=7)       # 精简为两行, 缩小字号
+sci_legend(ax_main, loc='upper right', fontsize=7,
+           handlelength=1.8, handletextpad=0.5, labelspacing=0.35, borderpad=0.4)
+ax_num.set_ylabel('Predicted risk ≥\nthreshold per 1000', fontsize=7)
 ax_num.set_xlabel('Threshold probability')
 ax_num.set_ylim([0, 1000])
 ax_num.spines['top'].set_visible(False)
 ax_num.spines['right'].set_visible(False)
 
 plt.tight_layout()
-plt.savefig('figures/DCA_Analysis_Calibrated.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/DCA_Analysis_Calibrated.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/DCA_Analysis_Calibrated.png / .pdf")
+plt.savefig('figures/DCA_Analysis.png', dpi=600, bbox_inches='tight')
+plt.savefig('figures/DCA_Analysis.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/DCA_Analysis.png / .pdf")
 plt.close()
 
-# ============================================================================
-# DCA 图3a: 内部校准前后对比
-# ============================================================================
-print("\n  [DCA 3a] 内部校准前后对比...")
-
-fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
-
-panel_configs_int = [
-    (y_int, prob_int,     'Internal - Original',   C_INT, axes[0], optimal_threshold),
-    (y_int, prob_int_cal, 'Internal - Calibrated',  C_INT, axes[1], clinical_threshold_cal_int),
-]
-
-for y_true_p, y_pred_p, title, color, ax, thresh_used in panel_configs_int:
-    threshs_dca = np.arange(0, 1.01, 0.01)
-
-    nbs_model = []
-    for t in threshs_dca:
-        if t >= 1.0:
-            nbs_model.append(0)
-            continue
-        tp = np.sum((y_pred_p >= t) & (y_true_p == 1))
-        fp = np.sum((y_pred_p >= t) & (y_true_p == 0))
-        nb = (tp / len(y_true_p)) - (fp / len(y_true_p)) * (t / (1 - t))
-        nbs_model.append(nb)
-
-    ax.plot(threshs_dca, nbs_model, color=color, lw=1.5, label='Model')
-
-    prev_local = np.sum(y_true_p == 1) / len(y_true_p)
-    all_nb_local = prev_local - (1 - prev_local) * (threshs_dca / (1 - threshs_dca + 1e-10))
-    ax.plot(threshs_dca, all_nb_local, color='#999999', ls='--', lw=1.2,
-            alpha=0.7, label='Treat All')
-    ax.axhline(y=0, color='black', lw=0.8, ls='-.', label='Treat none')
-
-    idx_opt = np.argmin(np.abs(threshs_dca - thresh_used))
-    nb_opt = nbs_model[idx_opt]
-    ax.plot(thresh_used, nb_opt, 'r*', markersize=12,
-            label=f'Threshold ({thresh_used:.3f}): NB={nb_opt:.4f}')
-
-    ax.set_xlim([0, 0.5])
-    ax.set_ylim([-0.05, max(max(nbs_model), all_nb_local.max()) + 0.05])
-    ax.set_xlabel('Threshold probability')
-    ax.set_ylabel('Net benefit')
-    ax.set_title(f'{title}')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    sci_legend(ax, loc='upper right')
-
-plt.tight_layout()
-plt.savefig('figures/DCA_Internal_BeforeAfter.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/DCA_Internal_BeforeAfter.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/DCA_Internal_BeforeAfter.png / .pdf")
-plt.close()
-
-# ============================================================================
-# DCA 图3b: 外部校准前后对比
-# ============================================================================
-print("\n  [DCA 3b] 外部校准前后对比...")
-
-fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
-
-panel_configs_ext = [
-    (y_ext, prob_ext,     'External - Original',   C_EXT, axes[0], optimal_threshold),
-    (y_ext, prob_ext_cal, 'External - Calibrated',  C_EXT, axes[1], clinical_threshold_cal_ext),
-]
-
-for y_true_p, y_pred_p, title, color, ax, thresh_used in panel_configs_ext:
-    threshs_dca = np.arange(0, 1.01, 0.01)
-
-    nbs_model = []
-    for t in threshs_dca:
-        if t >= 1.0:
-            nbs_model.append(0)
-            continue
-        tp = np.sum((y_pred_p >= t) & (y_true_p == 1))
-        fp = np.sum((y_pred_p >= t) & (y_true_p == 0))
-        nb = (tp / len(y_true_p)) - (fp / len(y_true_p)) * (t / (1 - t))
-        nbs_model.append(nb)
-
-    ax.plot(threshs_dca, nbs_model, color=color, lw=1.5, label='Model')
-
-    prev_local = np.sum(y_true_p == 1) / len(y_true_p)
-    all_nb_local = prev_local - (1 - prev_local) * (threshs_dca / (1 - threshs_dca + 1e-10))
-    ax.plot(threshs_dca, all_nb_local, color='#999999', ls='--', lw=1.2,
-            alpha=0.7, label='Treat All')
-    ax.axhline(y=0, color='black', lw=0.8, ls='-.', label='Treat none')
-
-    idx_opt = np.argmin(np.abs(threshs_dca - thresh_used))
-    nb_opt = nbs_model[idx_opt]
-    ax.plot(thresh_used, nb_opt, 'r*', markersize=12,
-            label=f'Threshold ({thresh_used:.3f}): NB={nb_opt:.4f}')
-
-    ax.set_xlim([0, 0.5])
-    ax.set_ylim([-0.05, max(max(nbs_model), all_nb_local.max()) + 0.05])
-    ax.set_xlabel('Threshold probability')
-    ax.set_ylabel('Net benefit')
-    ax.set_title(f'{title}')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    sci_legend(ax, loc='upper right')
-
-plt.tight_layout()
-plt.savefig('figures/DCA_External_BeforeAfter.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/DCA_External_BeforeAfter.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/DCA_External_BeforeAfter.png / .pdf")
-plt.close()
-
-# ============================================================================
-# DCA 图3c: 内部+外部校准后对比
-# ============================================================================
-print("\n  [DCA 3c] 内部+外部校准后对比...")
-
-fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
-
-panel_configs_cal = [
-    (y_int, prob_int_cal, 'Internal - Calibrated', C_INT, axes[0], clinical_threshold_cal_int),
-    (y_ext, prob_ext_cal, 'External - Calibrated', C_EXT, axes[1], clinical_threshold_cal_ext),
-]
-
-# ---------- 第一轮: 计算所有面板数据 + 收集全局 y 范围 ----------
-panel_results = []
-global_ymax = -np.inf
-
-for y_true_p, y_pred_p, title, color, ax, thresh_used in panel_configs_cal:
-    threshs_dca = np.arange(0, 1.01, 0.01)
-
-    nbs_model = []
-    for t in threshs_dca:
-        if t >= 1.0:
-            nbs_model.append(0)
-            continue
-        tp = np.sum((y_pred_p >= t) & (y_true_p == 1))
-        fp = np.sum((y_pred_p >= t) & (y_true_p == 0))
-        nb = (tp / len(y_true_p)) - (fp / len(y_true_p)) * (t / (1 - t))
-        nbs_model.append(nb)
-
-    prev_local = np.sum(y_true_p == 1) / len(y_true_p)
-    all_nb_local = prev_local - (1 - prev_local) * (threshs_dca / (1 - threshs_dca + 1e-10))
-
-    idx_opt = np.argmin(np.abs(threshs_dca - thresh_used))
-    nb_opt = nbs_model[idx_opt]
-
-    local_ymax = max(max(nbs_model), all_nb_local.max())
-    global_ymax = max(global_ymax, local_ymax)
-
-    panel_results.append({
-        'threshs_dca': threshs_dca, 'nbs_model': nbs_model,
-        'all_nb_local': all_nb_local, 'prev_local': prev_local,
-        'thresh_used': thresh_used, 'nb_opt': nb_opt, 'idx_opt': idx_opt,
-        'title': title, 'color': color, 'ax': ax,
-    })
-
-shared_ylim = [-0.05, global_ymax + 0.05]
-
-# ---------- 第二轮: 统一绘图 ----------
-for r in panel_results:
-    ax = r['ax']
-
-    ax.plot(r['threshs_dca'], r['nbs_model'], color=r['color'], lw=1.5,
-            label='Model')
-    ax.plot(r['threshs_dca'], r['all_nb_local'], color='#999999', ls='--', lw=1.2,
-            alpha=0.7, label='Treat All')
-    ax.axhline(y=0, color='black', lw=0.8, ls='-.', label='Treat none')
-    ax.plot(r['thresh_used'], r['nb_opt'], 'r*', markersize=12,
-            label=f'Threshold ({r["thresh_used"]:.3f}): NB={r["nb_opt"]:.4f}')
-
-    ax.set_xlim([0, 0.5])
-    ax.set_ylim(shared_ylim)
-    ax.set_xlabel('Threshold probability')
-    ax.set_ylabel('Net benefit')
-    ax.set_title(f'{r["title"]}')
-
-    # spine 粗细与 ROC_CI 一致
-    for spine in ax.spines.values():
-        spine.set_linewidth(0.8)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.tick_params(width=0.8)
-
-    sci_legend(ax, loc='upper right')
-
-plt.tight_layout()
-plt.savefig('figures/DCA_Calibrated_IntExt.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/DCA_Calibrated_IntExt.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/DCA_Calibrated_IntExt.png / .pdf")
-plt.close()
-print(f"\n" + "="*80)
-print("✅ 校准曲线和 DCA 曲线绘制完成（含截距校准前后对比）！")
-print("="*80 + "\n")
+print("\n" + "=" * 60)
+print("✅ 正文六图已全部生成（均为单图，含 PNG + PDF）：")
+print("   A   : figures/ROC_Internal.png")
+print("   B   : figures/ROC_External.png")
+print("   C   : figures/PR_Internal.png")
+print("   D   : figures/PR_External.png")
+print("   A+B : figures/ROC_Internal_vs_External.png   ← 新增（内外部叠加）")
+print("   C+D : figures/PR_Internal_vs_External.png    ← 新增（内外部叠加）")
+print("         figures/ROC_PR_Internal_vs_External_Metrics.csv（对应数值表）")
+print(f"   E   : figures/Calibration_Publication_v2_{TIMESTAMP}.png")
+print("   F   : figures/DCA_Analysis.png")
+print("=" * 60)
 
 
+# ==========================================================
+# 五、混淆矩阵（内部 + 外部，均使用原始概率与原始锁定阈值）
+# ==========================================================
+print("\n" + "=" * 60)
+print("🧩 绘制混淆矩阵 ...")
+print("=" * 60)
 
-# ==========================================
-# 4. Bootstrap 分析（仅外部验证）
-# ==========================================
-print("\n[3/9] 执行Bootstrap分析（外部验证）...")
-def bootstrap_metrics(y_true, y_prob, threshold, n_bootstrap=1000):
-    """Bootstrap计算指标的置信区间（含不平衡数据核心指标）"""
-    np.random.seed(42)
-    n_samples = len(y_true)
-    
-    metrics = {
-        'AUC': [],
-        'AUPRC': [],
-        'Sensitivity': [],
-        'Specificity': [],
-        'PPV': [],
-        'NPV': [],
-        'F1': [],
-        'MCC': [],
-        'G_mean': [],
-        'Balanced_Acc': [],
-    }
-    
-    for _ in range(n_bootstrap):
-        # 重采样
-        indices = np.random.choice(n_samples, n_samples, replace=True)
-        y_boot = y_true[indices]
-        p_boot = y_prob[indices]
-        
-        # 计算 AUC 和 AUPRC
-        try:
-            from sklearn.metrics import average_precision_score
-            auc_boot = roc_auc_score(y_boot, p_boot)
-            metrics['AUC'].append(auc_boot)
-            metrics['AUPRC'].append(average_precision_score(y_boot, p_boot))
-        except:
-            pass
-        
-        # 预测
-        y_pred_boot = (p_boot >= threshold).astype(int)
-        
-        # 混淆矩阵
-        cm = confusion_matrix(y_boot, y_pred_boot)
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-            
-            sens = tp / (tp + fn) if (tp + fn) > 0 else 0
-            spec = tn / (tn + fp) if (tn + fp) > 0 else 0
-            ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
-            npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-            f1 = 2 * ppv * sens / (ppv + sens) if (ppv + sens) > 0 else 0
-            
-            metrics['Sensitivity'].append(sens)
-            metrics['Specificity'].append(spec)
-            metrics['PPV'].append(ppv)
-            metrics['NPV'].append(npv)
-            metrics['F1'].append(f1)
-            metrics['MCC'].append(matthews_corrcoef(y_boot, y_pred_boot))
-            metrics['G_mean'].append(np.sqrt(sens * spec))
-            metrics['Balanced_Acc'].append((sens + spec) / 2.0)
-    
-    # 计算置信区间
-    summary = {}
-    for metric_name, values in metrics.items():
-        if len(values) > 0:
-            summary[metric_name] = {
-                'Mean': np.mean(values),
-                '95%_CI_Lower': np.percentile(values, 2.5),
-                '95%_CI_Upper': np.percentile(values, 97.5)
-            }
-    
-    return pd.DataFrame(summary).T
-# ====== 重新计算校准后的 Bootstrap CI ======
-print("  重新计算校准后 Bootstrap CI (外部验证)...")
-df_bootstrap_cal_ext = bootstrap_metrics(
-    y_ext, 
-    prob_ext_cal,                  # ← 校准后概率
-    clinical_threshold_cal_ext,    # ← 校准后阈值
-    n_bootstrap=1000
-)
-print(f"  ✓ 校准后外部验证 Bootstrap CI 计算完成")
 
-# 同理，如需内部验证的 CI
-df_bootstrap_cal_int = bootstrap_metrics(
-    y_int, 
-    prob_int_cal, 
-    clinical_threshold_cal_int, 
-    n_bootstrap=1000
-)
-print(f"  ✓ 内部验证 Bootstrap CI 计算完成")
-
-# ==========================================
-# 5. 绘制混淆矩阵（内部+外部）
-# ==========================================
-print("\n[4/9] 绘制混淆矩阵...")
-
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-
-def plot_confusion_matrix(y_true, y_prob, threshold, dataset_name, color=None, 
+def plot_confusion_matrix(y_true, y_prob, threshold, dataset_name, color=None,
                           save_path=None, cmap='Blues'):
-    """绘制混淆矩阵热图"""
+    """绘制混淆矩阵热图（阈值为原始概率尺度上的锁定阈值）"""
     y_pred = (y_prob >= threshold).astype(int)
     cm = confusion_matrix(y_true, y_pred)
-    
-    # 计算百分比
+
+    # 计算百分比（按真实类别行归一）
     cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
-    
+
     # 创建标注文本
     annot = np.empty_like(cm, dtype=object)
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             annot[i, j] = f'{cm[i, j]}\n({cm_percent[i, j]:.1f}%)'
-    
+
     # 绘图 — 关闭 sns 自带 cbar, 后面手动添加等高 colorbar
     fig, ax = plt.subplots(figsize=(3.5, 3.5))
     sns.heatmap(cm, annot=annot, fmt='', cmap=cmap, cbar=False,
@@ -2122,60 +1229,56 @@ def plot_confusion_matrix(y_true, y_prob, threshold, dataset_name, color=None,
                 xticklabels=['Non-recurrence', 'Recurrence'],
                 yticklabels=['Non-recurrence', 'Recurrence'],
                 ax=ax)
-    
+
     # 用 make_axes_locatable 切出等高 colorbar 轴
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="5%", pad=0.1)
     cbar = fig.colorbar(ax.collections[0], cax=cax, label='')
     cbar.outline.set_visible(False)          # 去掉 colorbar 黑色外框线
-    
+
     plt.sca(ax)
     plt.title(f'{dataset_name}', fontsize=10, pad=15)
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
+    plt.savefig(save_path.replace('.png', '.pdf'), bbox_inches='tight')
     print(f"  ✓ 已保存: {save_path}")
     plt.close()
-    
+
     return cm
 
-cm_int = plot_confusion_matrix(y_int, prob_int_cal, clinical_threshold_cal_int, 
-                                'Internal (Calibrated)', 
-                                save_path='figures/Confusion_Matrix_Internal.png',
-                                cmap='Blues')
 
-cm_ext = plot_confusion_matrix(y_ext, prob_ext_cal, clinical_threshold_cal_ext, 
-                                'External (Calibrated)', 
-                                save_path='figures/Confusion_Matrix_External.png',
-                                cmap='Oranges')
+cm_int = plot_confusion_matrix(y_int, prob_int, clinical_threshold,
+                               'Internal',
+                               save_path='figures/Confusion_Matrix_Internal.png',
+                               cmap='Blues')
 
-# ==========================================
-# 6. 绘制并排混淆矩阵对比
-# ==========================================
-print("\n[5/9] 绘制混淆矩阵对比图...")
-from matplotlib.colors import LinearSegmentedColormap
-# 定义一次，全局复用
-cmap_int = LinearSegmentedColormap.from_list('cmap_int', ['#FFFFFF', C_INT])  # 白→深蓝
-cmap_ext = LinearSegmentedColormap.from_list('cmap_ext', ['#FFFFFF', C_EXT])  # 白→红
+cm_ext = plot_confusion_matrix(y_ext, prob_ext, clinical_threshold,
+                               'External',
+                               save_path='figures/Confusion_Matrix_External.png',
+                               cmap='Oranges')
+
+
+# ---------------- 并排混淆矩阵对比（版本 1：行归一百分比）----------------
+print("\n[混淆矩阵] 绘制并排对比图 ...")
 
 fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 
 for idx, (y_true, y_prob, threshold, dataset_name, color, ax) in enumerate([
-    (y_int, prob_int_cal, clinical_threshold_cal_int, 'Internal (Calibrated)', C_INT, axes[0]),
-    (y_ext, prob_ext_cal, clinical_threshold_cal_ext, 'External (Calibrated)', C_EXT, axes[1])
+    (y_int, prob_int, clinical_threshold, 'Internal', C_INT, axes[0]),
+    (y_ext, prob_ext, clinical_threshold, 'External', C_EXT, axes[1])
 ]):
     y_pred = (y_prob >= threshold).astype(int)
     cm = confusion_matrix(y_true, y_pred)
     cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
-    
+
     annot = np.empty_like(cm, dtype=object)
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             annot[i, j] = f'{cm[i, j]}\n({cm_percent[i, j]:.1f}%)'
 
-    # 使用
     cmap = 'Blues' if idx == 0 else 'Oranges'
 
     sns.heatmap(cm, annot=annot, fmt='', cmap=cmap, cbar=True,
@@ -2184,101 +1287,51 @@ for idx, (y_true, y_prob, threshold, dataset_name, color, ax) in enumerate([
                 yticklabels=['Non-recurrence', 'Recurrence'],
                 annot_kws={"size": 14},
                 ax=ax, cbar_kws={'label': 'Count'})
-    
-    ax.set_title(f'{dataset_name}', 
-                 fontsize=15, pad=10)
-    ax.set_ylabel('True Label',fontsize=13, labelpad=10)
-    ax.set_xlabel('Predicted Label',fontsize=13, labelpad=10)
+
+    ax.set_title(f'{dataset_name}', fontsize=15, pad=10)
+    ax.set_ylabel('True Label', fontsize=13, labelpad=10)
+    ax.set_xlabel('Predicted Label', fontsize=13, labelpad=10)
     ax.set_xticklabels(ax.get_xticklabels(), fontsize=12)
     ax.set_yticklabels(ax.get_yticklabels(), fontsize=12)
 
-# plt.suptitle('Confusion Matrix Comparison', fontsize=16, y=1.02)
 plt.tight_layout()
 plt.savefig('figures/Confusion_Matrix_Comparison.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/Confusion_Matrix_Comparison.png")
+plt.savefig('figures/Confusion_Matrix_Comparison.pdf', bbox_inches='tight')
+print("  ✓ 已保存: figures/Confusion_Matrix_Comparison.png")
 plt.close()
 
 
 
+# ---------------- 混淆矩阵指标详细对比表 ----------------
+print("\n[混淆矩阵] 生成指标详细对比表 ...")
 
-fig, axes = plt.subplots(1, 2, figsize=(16, 7)) #稍微增加高度以容纳标题
+# 若上游提供了外部 bootstrap 指标表（df_bootstrap_ext），则附上 95% CI
+_df_boot_ext = df_bootstrap_ext          # 来自 External_Val_Bootstrap_1000_<TS>.csv
 
-# 定义标签列表，匹配图片格式
-labels = ['Non-recurrence', 'Recurrence']
 
-for idx, (y_true, y_prob, threshold, dataset_name, color, ax) in enumerate([
-    (y_int, prob_int_cal, clinical_threshold_cal_int, 'Internal (Calibrated)', C_INT, axes[0]),
-    (y_ext, prob_ext_cal, clinical_threshold_cal_ext, 'External (Calibrated)', C_EXT, axes[1])
-]):
-    # 1. 预测与混淆矩阵计算
-    y_pred = (y_prob >= threshold).astype(int)
-    cm = confusion_matrix(y_true, y_pred)
-    
-    # 计算各项指标 (用于标题)
-    tn, fp, fn, tp = cm.ravel()
-    accuracy = (tp + tn) / (tp + tn + fp + fn)
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-    mcc_val = matthews_corrcoef(y_true, y_pred)
-    g_mean_val = np.sqrt(sensitivity * specificity)
-    
-    # 2. 准备注释文本 (数值 + 总百分比)
-    # 图片显示的是占总样本的百分比 (例如 338/701 = 48.2%)
-    cm_percent = cm.astype('float') / cm.sum() * 100
-    
-    annot = np.empty_like(cm, dtype=object)
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            annot[i, j] = f'{cm[i, j]}\n({cm_percent[i, j]:.1f}%)'
-    
-    # 3. 确定配色 (Internal用蓝, External用橙)
-    cmap = cmap_int if idx == 0 else cmap_ext
-    
-    # 4. 绘图
-    sns.heatmap(cm, annot=annot, fmt='', cmap=cmap, cbar=True,
-                square=True, linewidths=2, linecolor='white',
-                xticklabels=labels,
-                yticklabels=labels,
-                annot_kws={"size": 14}, # 增大字体
-                ax=ax, cbar_kws={'label': 'Count'})
-    
-    # 5. 设置复杂标题 (匹配图片格式)
-    # title_str = (f"{dataset_name}\n"
-    #              f"Threshold: {clinical_threshold:.3f} | Accuracy: {accuracy:.3f}\n"
-    #              f"Sensitivity: {sensitivity:.3f} | Specificity: {specificity:.3f}\n"
-    #              f"PPV: {ppv:.3f} | NPV: {npv:.3f}\n"
-    #              f"MCC: {mcc_val:.3f} | G-mean: {g_mean_val:.3f}")
-    
-    title_str = (f"{dataset_name}")
-    
-    ax.set_title(title_str, pad=10)
-    
-    # 6. 轴标签设置
-    ax.set_ylabel('True Label')
-    ax.set_xlabel('Predicted Label')
+def _ci_str(key):
+    """从外部 bootstrap 指标表安全取 95% CI 字符串
+       （建模脚本保存的指标键：AUC / Brier / AP / Sensitivity / Specificity /
+         PPV / NPV / F1 / MCC / G_mean / Balanced_Acc）"""
+    if _df_boot_ext is None or key not in _df_boot_ext.index:
+        return 'N/A'
+    if '95%_CI_Lower' not in _df_boot_ext.columns:
+        return 'N/A'
+    lo = _df_boot_ext.loc[key, '95%_CI_Lower']
+    hi = _df_boot_ext.loc[key, '95%_CI_Upper']
+    return f"{lo:.4f}-{hi:.4f}"
 
-plt.tight_layout()
-plt.savefig('figures/Confusion_Matrix_Comparison2.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/Confusion_Matrix_Comparison2.png")
-plt.close()
-
-# ==========================================
-# 7. 混淆矩阵指标详细对比表
-# ==========================================
-print("\n[6/9] 生成混淆矩阵指标详细对比表...")
 
 metrics_comparison = []
 
 for dataset_name, y_true, y_p, thresh in [
-    ('Internal (Calibrated)', y_int, prob_int_cal, clinical_threshold_cal_int), 
-    ('External (Calibrated)', y_ext, prob_ext_cal, clinical_threshold_cal_ext)
+    ('Internal', y_int, prob_int, clinical_threshold),
+    ('External', y_ext, prob_ext, clinical_threshold)
 ]:
     y_pred = (y_p >= thresh).astype(int)
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
-    
+
     sens = tp / (tp + fn) if (tp + fn) > 0 else 0
     spec = tn / (tn + fp) if (tn + fp) > 0 else 0
     ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
@@ -2288,23 +1341,19 @@ for dataset_name, y_true, y_p, thresh in [
     mcc = matthews_corrcoef(y_true, y_pred)
     g_mean = np.sqrt(sens * spec)
     balanced_acc = (sens + spec) / 2.0
-    
-    # 从 Bootstrap 获取置信区间（仅外部验证）
-    if dataset_name == 'External (Calibrated)':
-        sens_ci = f"{df_bootstrap_cal_ext.loc['Sensitivity', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['Sensitivity', '95%_CI_Upper']:.4f}"
-        spec_ci = f"{df_bootstrap_cal_ext.loc['Specificity', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['Specificity', '95%_CI_Upper']:.4f}"
-        ppv_ci  = f"{df_bootstrap_cal_ext.loc['PPV', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['PPV', '95%_CI_Upper']:.4f}"
-        npv_ci  = f"{df_bootstrap_cal_ext.loc['NPV', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['NPV', '95%_CI_Upper']:.4f}"
-        f1_ci   = f"{df_bootstrap_cal_ext.loc['F1', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['F1', '95%_CI_Upper']:.4f}" if 'F1' in df_bootstrap_cal_ext.index else 'N/A'
-        mcc_ci  = f"{df_bootstrap_cal_ext.loc['MCC', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['MCC', '95%_CI_Upper']:.4f}" if 'MCC' in df_bootstrap_cal_ext.index else 'N/A'
-        gmean_ci  = f"{df_bootstrap_cal_ext.loc['G_mean', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['G_mean', '95%_CI_Upper']:.4f}" if 'G_mean' in df_bootstrap_cal_ext.index else 'N/A'
-        balacc_ci = f"{df_bootstrap_cal_ext.loc['Balanced_Acc', '95%_CI_Lower']:.4f}-{df_bootstrap_cal_ext.loc['Balanced_Acc', '95%_CI_Upper']:.4f}" if 'Balanced_Acc' in df_bootstrap_cal_ext.index else 'N/A'
+
+    # 仅外部验证附 bootstrap 95% CI
+    if dataset_name == 'External':
+        sens_ci, spec_ci = _ci_str('Sensitivity'), _ci_str('Specificity')
+        ppv_ci,  npv_ci  = _ci_str('PPV'),         _ci_str('NPV')
+        f1_ci,   mcc_ci  = _ci_str('F1'),          _ci_str('MCC')
+        gmean_ci, balacc_ci = _ci_str('G_mean'),   _ci_str('Balanced_Acc')
     else:
         sens_ci = spec_ci = ppv_ci = npv_ci = f1_ci = mcc_ci = gmean_ci = balacc_ci = 'N/A'
-    
+
     metrics_comparison.append({
         'Dataset': dataset_name,
-        'Threshold': thresh, 
+        'Threshold': thresh,
         'True Positive (TP)': tp,
         'True Negative (TN)': tn,
         'False Positive (FP)': fp,
@@ -2330,807 +1379,343 @@ for dataset_name, y_true, y_p, thresh in [
 
 df_metrics_comparison = pd.DataFrame(metrics_comparison)
 df_metrics_comparison.to_csv('figures/Confusion_Matrix_Metrics_Comparison.csv', index=False)
-print(f"  ✓ 已保存: figures/Confusion_Matrix_Metrics_Comparison.csv")
+print("  ✓ 已保存: figures/Confusion_Matrix_Metrics_Comparison.csv")
 
-# 打印到控制台
-print("\n" + "="*80)
-print("混淆矩阵指标详细对比")
-print("="*80)
+print("\n" + "=" * 80)
+print("混淆矩阵指标详细对比（原始概率 + 原始锁定阈值）")
+print("=" * 80)
 print(df_metrics_comparison.to_string(index=False))
-print("="*80 + "\n")
+print("=" * 80 + "\n")
 
-# ==========================================
-# 8. 混淆矩阵指标可视化对比（雷达图）
-# ==========================================
-print("[7/9] 绘制混淆矩阵指标雷达图对比...")
-from math import pi
-# 准备雷达图数据
-categories = ['Sensitivity', 'Specificity', 'PPV', 'NPV', 'F1-Score', 'MCC', 'G-mean', 'Bal.Acc']
-N = len(categories)
 
-# 计算每个数据集的指标
-values_int = []
-values_ext = []
+# ==========================================================================================
+# 六、Figure 2A / 2B — 风险梯度 & 事件集中度
+# ==========================================================================================
 
-for y_true, y_p, thresh, values_list in [
-    (y_int, prob_int_cal, clinical_threshold_cal_int, values_int), 
-    (y_ext, prob_ext_cal, clinical_threshold_cal_ext, values_ext)
-]:
-    y_pred = (y_p >= thresh).astype(int)
-    cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel()
-    
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-    f1 = 2 * (ppv * sens) / (ppv + sens) if (ppv + sens) > 0 else 0
-    mcc = matthews_corrcoef(y_true, y_pred)
-    g_mean = np.sqrt(sens * spec)
-    balanced_acc = (sens + spec) / 2.0
-    
-    # 【注意】MCC范围是[-1,1]，归一化到[0,1]供雷达图显示
-    mcc_normalized = (mcc + 1) / 2.0
-    
-    values_list.extend([sens, spec, ppv, npv, f1, mcc_normalized, g_mean, balanced_acc])
+# ---------------- 可调参数 ----------------
+LOW_CUT, HIGH_CUT = 0.05, 0.15          # 与正文一致的固定切点（原始概率尺度）
+OUTPUT_DIR = "figures"
+TIER_NAMES = ["Low", "Moderate", "High"]   # 与正文统一：Moderate（非 Medium）
+PATIENT_COLOR = "#9DC3E6"                # 患者占比（浅蓝）
+EVENT_COLOR   = "#C00000"                # 事件占比 / 事件（红）
+Z_95 = 1.959963984540054                 # 95% 双侧正态分位数
+_DPI = DPI
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 闭合雷达图
-values_int += values_int[:1]
-values_ext += values_ext[:1]
+y_int_arr = np.asarray(y_int)
+y_ext_arr = np.asarray(y_ext)
+p_int_arr = np.asarray(prob_int)
+p_ext_arr = np.asarray(prob_ext)
 
-# 计算角度
-angles = [n / float(N) * 2 * pi for n in range(N)]
-angles += angles[:1]
+# 队列定义: (显示名, 真实标签, 预测概率, 颜色)
+COHORTS = [
+    ("Development",          y_int_arr, p_int_arr, COLOR_INTERNAL),
+    ("External validation",  y_ext_arr, p_ext_arr, COLOR_EXTERNAL),
+]
 
-# 绘制雷达图
-fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection='polar'))
 
-ax.plot(angles, values_int, 'o-', linewidth=2.5, label='Internal', 
-        color=COLOR_INTERNAL, markersize=8)
-ax.fill(angles, values_int, alpha=0.15, color=COLOR_INTERNAL)
+# ------------------------------------------------------------------
+# 二项比例 95% CI —— Wilson 评分区间
+#   相比正态近似(Wald)，在样本量小或事件率接近 0（如 Low 组）时更稳健，
+#   且区间始终落在 [0, 1] 内，适合作再脱离率这类小比例的不确定性展示。
+# ------------------------------------------------------------------
+def _wilson_ci(k, n, z=Z_95):
+    if n <= 0:
+        return 0.0, 0.0
+    p = k / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = (z / denom) * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, center - half), min(1.0, center + half)
 
-ax.plot(angles, values_ext, 's-', linewidth=2.5, label='External', 
-        color=COLOR_EXTERNAL, markersize=8)
-ax.fill(angles, values_ext, alpha=0.15, color=COLOR_EXTERNAL)
 
-# 设置刻度和标签
-ax.set_xticks(angles[:-1])
-ax.set_xticklabels(categories)
-ax.set_ylim(0, 1)
-ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
-ax.set_yticklabels(['0.2', '0.4', '0.6', '0.8', '1.0'], fontsize=9)
-ax.grid(True, linestyle='--', alpha=0.6)
+# ------------------------------------------------------------------
+# 风险分组(固定切点) → 各组 n/events/event_rate/95%CI 及整体 χ² p
+# ------------------------------------------------------------------
+def _risk_groups(y_true, y_prob, low_cut=LOW_CUT, high_cut=HIGH_CUT):
+    y_true, y_prob = np.asarray(y_true), np.asarray(y_prob)
+    masks = [y_prob < low_cut,
+             (y_prob >= low_cut) & (y_prob < high_cut),
+             y_prob >= high_cut]
+    groups, cont = [], []
+    for m in masks:
+        n = int(m.sum())
+        ev = int(y_true[m].sum()) if n else 0
+        lo, hi = _wilson_ci(ev, n)
+        groups.append({"n": n, "events": ev, "non_events": n - ev,
+                       "event_rate": ev / n if n else 0.0,
+                       "ci_low": lo, "ci_high": hi})
+        cont.append([ev, n - ev])
+    try:
+        _, p, _, _ = chi2_contingency(np.array(cont))
+    except Exception:
+        p = np.nan
+    return groups, p
 
-plt.title(f'Performance Comparison (Calibrated)', fontsize=14, pad=20)
-plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
 
-plt.tight_layout()
-plt.savefig('figures/Confusion_Matrix_Radar_Comparison.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/Confusion_Matrix_Radar_Comparison.png")
-plt.close()
+def _p_str(p):
+    """仅返回 p 的数值部分: '<0.001' / '0.023' / 'N/A'。"""
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return "N/A"
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
 
-# ==========================================
-# 9. 绘制指标柱状图对比
-# ==========================================
-print("\n[8/9] 绘制指标柱状图对比...")
 
-# 准备数据
-metrics_names = ['Sensitivity', 'Specificity', 'PPV', 'NPV', 'F1-Score', 'MCC', 'G-mean', 'Bal.Acc']
-internal_values = []
-external_values = []
+def _p_label(p, prefix="\u03c7\u00b2 p"):
+    """
+    规范化 p 值写法（避免出现 'χ² p = <0.001' 这类等号+不等号并存）：
+        p < 0.001  →  'χ² p <0.001'
+        其他       →  'χ² p = 0.023'
+    """
+    s = _p_str(p)
+    return f"{prefix} {s}" if s.startswith("<") else f"{prefix} = {s}"
 
-for y_true, y_p, thresh, values_list in [
-    (y_int, prob_int_cal, clinical_threshold_cal_int, internal_values), 
-    (y_ext, prob_ext_cal, clinical_threshold_cal_ext, external_values)
-]:
-    y_pred = (y_p >= thresh).astype(int)
-    cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel()
-    
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-    f1 = 2 * (ppv * sens) / (ppv + sens) if (ppv + sens) > 0 else 0
-    mcc = matthews_corrcoef(y_true, y_pred)
-    g_mean = np.sqrt(sens * spec)
-    balanced_acc = (sens + spec) / 2.0
-    
-    values_list.extend([sens, spec, ppv, npv, f1, mcc, g_mean, balanced_acc])
 
-# 绘制柱状图
-x = np.arange(len(metrics_names))
-width = 0.35
+# ==================================================================
+# Figure 2A — 风险梯度: 点图 + 95% CI
+# ==================================================================
+def plot_figure2a(cohorts=COHORTS, low_cut=LOW_CUT, high_cut=HIGH_CUT):
+    ranges = [f"<{low_cut:.0%}",
+              f"{low_cut:.0%}\u2013{high_cut:.0%}",
+              f"\u2265{high_cut:.0%}"]
+    x = np.arange(3)
+    n_c = len(cohorts)
+    span = 0.30
+    offsets = np.linspace(-span, span, n_c) if n_c > 1 else np.array([0.0])
 
-fig, ax = plt.subplots(figsize=(12, 6))
-bars1 = ax.bar(x - width/2, internal_values, width, label='Internal', 
-               color=COLOR_INTERNAL, alpha=0.8)
-bars2 = ax.bar(x + width/2, external_values, width, label='External', 
-               color=COLOR_EXTERNAL, alpha=0.8)
+    data = []
+    for name, yt, yp, color in cohorts:
+        groups, p = _risk_groups(yt, yp, low_cut, high_cut)
+        rate = np.array([g["event_rate"] for g in groups]) * 100
+        lo = np.array([g["ci_low"] for g in groups]) * 100
+        hi = np.array([g["ci_high"] for g in groups]) * 100
+        yerr = np.clip(np.vstack([rate - lo, hi - rate]), 0, None)   # 2×3
+        tot_n = sum(g["n"] for g in groups)
+        data.append((name, rate, yerr, hi, tot_n, p, color))
 
-# 添加数值标签
-for bars in [bars1, bars2]:
-    for bar in bars:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    ymax = max(h.max() for _, _, _, h, _, _, _ in data)             # 由 CI 上界定上限
 
-ax.set_xlabel('Metrics')
-ax.set_ylabel('Score')
-ax.set_title(f'Performance Comparison (Calibrated)', fontsize=14)
-ax.set_xticks(x)
-ax.set_xticklabels(metrics_names, rotation=0)
-ax.legend()
-ax.set_ylim([0, 1.1])
-ax.grid(axis='y', alpha=0.3, linestyle='--')
+    fig, ax = plt.subplots(figsize=(4, 3.5))
+    for off, (name, rate, yerr, hi, tot_n, p, color) in zip(offsets, data):
+        xc = x + off
+        ax.plot(xc, rate, ls="--", lw=1.0, color=color, alpha=0.45, zorder=2)
+        ax.errorbar(xc, rate, yerr=yerr, fmt="o", ms=7, capsize=4,
+                    elinewidth=1.4, capthick=1.4, color=color,
+                    markeredgecolor="white", markeredgewidth=0.8, zorder=4,
+                    label=f"{name} (n={tot_n:,}; {_p_label(p)})")
+        for cx, r, h in zip(xc, rate, hi):
+            ax.text(cx, h + ymax * 0.025, f"{r:.1f}%", ha="center", va="bottom",
+                    fontsize=8, color=color, zorder=5)
 
-plt.tight_layout()
-plt.savefig('figures/Confusion_Matrix_Metrics_Bar_Comparison.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/Confusion_Matrix_Metrics_Bar_Comparison.png")
-plt.close()
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{t}\n({r})" for t, r in zip(TIER_NAMES, ranges)])
+    ax.set_xlim(-0.6, 2.6)
+    ax.set_ylabel("Observed 12-month redetachment rate (%)")
+    ax.set_ylim(0, ymax * 1.22)
+    ax.set_title("Observed 12-month redetachment rate by risk group",
+                 fontsize=10, pad=10)
+    ax.yaxis.grid(True, ls=":", lw=0.6, alpha=0.5, zorder=0)
+    sci_legend(ax, loc="upper left")
 
-# ==========================================
-# 10. 总结
-# ==========================================
+    plt.tight_layout()
+    out = os.path.join(OUTPUT_DIR, "Figure2A_Risk_Gradient.png")
+    plt.savefig(out, dpi=_DPI)
+    plt.savefig(out.replace(".png", ".pdf"))                        # 矢量版备用
+    plt.close()
+    print(f"  \u2713 Figure 2A 已保存: {out}")
+    return out
+
+
+# ==================================================================
+# Figure 2B — 事件集中度: 上下对齐的横向条形图
+# ==================================================================
+def plot_figure2b(cohorts=COHORTS, low_cut=LOW_CUT, high_cut=HIGH_CUT):
+    n = len(cohorts)
+    fig, axes = plt.subplots(n, 1, figsize=(6, 2.4 * n),
+                             sharex=True, squeeze=False)
+    axes = axes[:, 0]
+    y, bh = np.arange(3), 0.38
+
+    legend_handles = None
+    for ax, (name, yt, yp, _color) in zip(axes, cohorts):
+        groups, p = _risk_groups(yt, yp, low_cut, high_cut)
+        ns = np.array([g["n"] for g in groups], float)
+        ev = np.array([g["events"] for g in groups], float)
+        ps = ns / ns.sum() * 100 if ns.sum() else np.zeros(3)
+        es = ev / ev.sum() * 100 if ev.sum() else np.zeros(3)
+
+        ax.barh(y - bh / 2, ps, bh, color=PATIENT_COLOR, edgecolor="white",
+                linewidth=0.8, label="% of patients", zorder=3)
+        ax.barh(y + bh / 2, es, bh, color=EVENT_COLOR, edgecolor="white",
+                linewidth=0.8, label="% of events", zorder=3)
+        for cy, v in zip(y - bh / 2, ps):
+            ax.text(v + 1.0, cy, f"{v:.1f}%", va="center", ha="left", fontsize=8)
+        for cy, v in zip(y + bh / 2, es):
+            ax.text(v + 1.0, cy, f"{v:.1f}%", va="center", ha="left", fontsize=8)
+
+        # High 组（事件占比最大者）富集倍数
+        hi = int(np.argmax(es))
+        enr = es[hi] / ps[hi] if ps[hi] > 0 else np.nan
+        ax.annotate(f"{enr:.1f}\u00d7 enrichment", (es[hi], y[hi] + bh / 2),
+                    xytext=(34, 0), textcoords="offset points",
+                    va="center", ha="left", fontsize=9, color=EVENT_COLOR,
+                    fontweight="bold")
+        ax.text(0.985, 0.50,
+                f"{TIER_NAMES[hi]} risk: {ps[hi]:.0f}% of patients\n"
+                f"capture {es[hi]:.0f}% of events\n"
+                f"{_p_label(p)}",
+                transform=ax.transAxes, va="center", ha="right", fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.4", fc="#FFF3F3",
+                          ec=EVENT_COLOR, lw=0.8))
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(TIER_NAMES)
+        ax.invert_yaxis()                       # Low 在上、High 在下（与 2A 顺序一致）
+        ax.set_xlim(0, 100)
+        ax.set_title(f"{name} (n={int(ns.sum()):,}, events={int(ev.sum())})",
+                     fontsize=10, loc="left")
+        ax.xaxis.grid(True, ls=":", lw=0.6, alpha=0.5, zorder=0)
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
+
+    axes[-1].set_xlabel("Proportion (%)")
+    fig.suptitle("Event concentration by risk group", fontsize=12, y=0.99)
+    fig.legend(legend_handles, legend_labels, loc="lower center",
+               ncol=2, frameon=False, fontsize=9,
+               bbox_to_anchor=(0.5, -0.01))
+
+    plt.tight_layout(rect=[0, 0.05, 1, 0.96])
+    out = os.path.join(OUTPUT_DIR, "Figure2B_Event_Concentration.png")
+    plt.savefig(out, dpi=_DPI, bbox_inches="tight")
+    plt.savefig(out.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close()
+    print(f"  \u2713 Figure 2B 已保存: {out}")
+    return out
+
+
 print(f"\n{'='*60}")
-print("✅ 混淆矩阵分析完成！")
+print("\U0001F4CA 绘制 Figure 2A / 2B (风险梯度 & 事件集中度)...")
 print(f"{'='*60}")
-print("\n生成的文件:")
-print("  📊 figures/Confusion_Matrix_Internal.png")
-print("  📊 figures/Confusion_Matrix_External.png")
-print("  📊 figures/Confusion_Matrix_Comparison.png")
-print("  📊 figures/Confusion_Matrix_Radar_Comparison.png")
-print("  📊 figures/Confusion_Matrix_Metrics_Bar_Comparison.png")
-print("  📄 figures/Confusion_Matrix_Metrics_Comparison.csv")
-print(f"\n{'='*60}\n")
-
-
-# ==========================================
-# 4. 多模型 ROC 对比与 DeLong 检验
-# ==========================================
-print(f"{'='*60}")
-print("📊 开始多模型性能对比分析...")
-print(f"{'='*60}\n")
-# ------------------------------------------
-# 4.1 DeLong 检验函数定义
-# ------------------------------------------
-def delong_roc_test(y_true, prob1, prob2):
-
-    from scipy import stats
-    
-    # 确保是 numpy 数组
-    y_true = np.asarray(y_true)
-    prob1 = np.asarray(prob1)
-    prob2 = np.asarray(prob2)
-    
-    def compute_midrank(x):
-        """计算中秩"""
-        J = np.argsort(x)
-        Z = x[J]
-        N = len(x)
-        T = np.zeros(N, dtype=float)
-        i = 0
-        while i < N:
-            j = i
-            while j < N and Z[j] == Z[i]:
-                j += 1
-            for k in range(i, j):
-                T[k] = 0.5 * (i + j - 1)
-            i = j
-        T2 = np.empty(N, dtype=float)
-        T2[J] = T + 1
-        return T2
-    
-    def compute_ground_truth_statistics(y_true):
-        """计算真实标签的统计信息"""
-        assert np.array_equal(np.unique(y_true), [0, 1])
-        order = (-y_true).argsort()
-        label_1_count = int(y_true.sum())
-        return order, label_1_count
-    
-    def fast_delong(predictions_sorted_transposed, label_1_count):
-        """快速 DeLong 算法"""
-        m = label_1_count
-        n = predictions_sorted_transposed.shape[1] - m
-        positive_examples = predictions_sorted_transposed[:, :m]
-        negative_examples = predictions_sorted_transposed[:, m:]
-        k = predictions_sorted_transposed.shape[0]
-
-        aucs = np.zeros(k)
-        score = np.zeros(k)
-        for j in range(k):
-            midrank = compute_midrank(predictions_sorted_transposed[j, :])
-            aucs[j] = (midrank[:m].sum() - m * (m + 1) / 2) / (m * n)
-            score[j] = aucs[j]
-
-        # 计算协方差
-        v01 = np.zeros((k, n))
-        v10 = np.zeros((k, m))
-        for j in range(k):
-            midrank = compute_midrank(predictions_sorted_transposed[j, :])
-            v10[j, :] = (midrank[:m] - np.arange(1, m + 1)) / n
-            v01[j, :] = 1 - (midrank[m:] - np.arange(m + 1, m + n + 1)) / m
-
-        sx = np.cov(v10) if k > 1 else np.var(v10) / m
-        sy = np.cov(v01) if k > 1 else np.var(v01) / n
-        delongcov = sx / m + sy / n
-
-        return aucs, delongcov
-    
-    order, label_1_count = compute_ground_truth_statistics(y_true)
-    predictions_sorted_transposed = np.vstack([prob1, prob2])[:, order]
-    
-    aucs, delongcov = fast_delong(predictions_sorted_transposed, label_1_count)
-    
-    auc1, auc2 = aucs[0], aucs[1]
-    
-    # 计算 z-统计量和 p 值
-    if isinstance(delongcov, np.ndarray):
-        var = delongcov[0, 0] + delongcov[1, 1] - 2 * delongcov[0, 1]
-    else:
-        var = 2 * delongcov
-    
-    z = (auc1 - auc2) / np.sqrt(var + 1e-10)
-    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
-    
-    return p_value, z, auc1, auc2
-# ------------------------------------------
-# 4.2 加载 DeLong 数据包
-# ------------------------------------------
-print("[1/6] 加载 DeLong 数据包...")
-# ========== 配置数据包路径 ==========
-DATA_full_package_PATH = f"{DATA_PATH}/DeLong_Data_Package_latest.pkl"  
-
-if not os.path.exists(DATA_full_package_PATH):
-    raise FileNotFoundError(f"❌ 未找到数据包: {DATA_full_package_PATH}")
-
-# 加载数据包
-delong_data = joblib.load(DATA_full_package_PATH)
-
-print(f"  ✓ 数据包加载成功: {DATA_full_package_PATH}")
-print(f"  ✓ 时间戳: {delong_data.get('timestamp', 'N/A')}")
-
-# ------------------------------------------
-# 4.3 解析数据包内容
-# ------------------------------------------
-print(f"\n[2/6] 解析数据包内容...")
-
-# 提取真实标签
-y_true_int = np.asarray(delong_data['y_internal'])
-y_true_ext = np.asarray(delong_data['y_external'])
-
-# 获取模型列表
-MODELS = delong_data['model_names']
-print(f"  ✓ 检测到 {len(MODELS)} 个模型: {', '.join(MODELS)}")
-print(f"  ✓ 内部验证样本数: {len(y_true_int)}")
-print(f"  ✓ 外部验证样本数: {len(y_true_ext)}")
-
-# 准备颜色列表
-# COLORS_LIST = plt.cm.tab10(np.linspace(0, 1, len(MODELS)))
-MODEL_COLORS = {model: COLORS_LIST[i] for i, model in enumerate(MODELS)}
-
-# 存储所有模型的预测结果
-model_preds_int = {}  # 内部验证预测
-model_preds_ext = {}  # 外部验证预测
-auc_scores_int = {}   # 内部验证 AUC
-auc_scores_ext = {}   # 外部验证 AUC
-ap_scores_int = {}    # 内部验证 AUPRC
-ap_scores_ext = {}    # 外部验证 AUPRC
-
-# 解析每个模型的预测数据
-from sklearn.metrics import average_precision_score
-print(f"\n  各模型 AUC / AUPRC 分数:")
-print(f"  {'-'*80}")
-print(f"  {'模型名称':20s} | {'Int AUC':10s} | {'Ext AUC':10s} | {'Int AUPRC':10s} | {'Ext AUPRC':10s}")
-print(f"  {'-'*80}")
-
-for model_name in MODELS:
-    pred_data = delong_data['model_predictions'].get(model_name, None)
-    
-    if pred_data is None:
-        print(f"  ⚠️ 未找到 {model_name} 的预测数据")
-        continue
-    
-    # 内部验证预测
-    if 'internal_probs' in pred_data:
-        model_preds_int[model_name] = np.asarray(pred_data['internal_probs'])
-        auc_scores_int[model_name] = roc_auc_score(y_true_int, model_preds_int[model_name])
-        ap_scores_int[model_name] = average_precision_score(y_true_int, model_preds_int[model_name])
-    
-    # 外部验证预测
-    if 'external_probs' in pred_data:
-        model_preds_ext[model_name] = np.asarray(pred_data['external_probs'])
-        auc_scores_ext[model_name] = roc_auc_score(y_true_ext, model_preds_ext[model_name])
-        ap_scores_ext[model_name] = average_precision_score(y_true_ext, model_preds_ext[model_name])
-    
-    # 打印 AUC + AUPRC
-    int_auc = auc_scores_int.get(model_name, None)
-    ext_auc = auc_scores_ext.get(model_name, None)
-    int_ap = ap_scores_int.get(model_name, None)
-    ext_ap = ap_scores_ext.get(model_name, None)
-    int_str = f"{int_auc:.4f}" if int_auc else "N/A"
-    ext_str = f"{ext_auc:.4f}" if ext_auc else "N/A"
-    int_ap_str = f"{int_ap:.4f}" if int_ap else "N/A"
-    ext_ap_str = f"{ext_ap:.4f}" if ext_ap else "N/A"
-    print(f"  {model_name:20s} | {int_str:10s} | {ext_str:10s} | {int_ap_str:10s} | {ext_ap_str:10s}")
-
-print(f"  {'-'*55}")
-
-# ------------------------------------------
-# 4.4 执行 DeLong 检验（内部验证）
-# ------------------------------------------
-print(f"\n[3/6] 执行 DeLong 检验 (内部验证)...")
-
-print(f"\n  DeLong 检验结果 (vs {best_model}):")
-print(f"  {'-'*65}")
-print(f"  {'模型':20s} | {'AUC':8s} | {'P-value':10s} | {'Z-stat':8s} | Sig")
-print(f"  {'-'*65}")
-
-delong_results_int = []
-for model_name in MODELS:
-    if model_name != best_model_name and model_name in model_preds_int:  # ← 修改1
-        p_val, z_stat, auc1, auc2 = delong_roc_test(
-            y_true_int, 
-            model_preds_int[best_model_name],  
-            model_preds_int[model_name]
-        )
-        
-        sig_marker = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else 'NS'
-        
-        delong_results_int.append({
-            'Comparison': f"{best_model_name} vs {model_name}", 
-            'Model': model_name,
-            'AUC': auc2,
-            'Best_Model': best_model_name,  
-            'Best_Model_AUC': auc1,
-            'AUC_Diff': auc1 - auc2,
-            'Z_Statistic': z_stat,
-            'P_Value': p_val,
-            'Significant': sig_marker
-        })
-        
-        print(f"  {model_name:20s} | {auc2:.4f}  | {p_val:.6f}  | {z_stat:7.4f}  | {sig_marker}")
-
-print(f"  {'-'*65}")
-print(f"  注: *** p<0.001, ** p<0.01, * p<0.05, NS: not significant")
-
-# ------------------------------------------
-# 4.5 执行 DeLong 检验（外部验证）
-# ------------------------------------------
-print(f"\n[4/6] 执行 DeLong 检验 (外部验证)...")
-
-print(f"\n  DeLong 检验结果 (vs {best_model}):")
-print(f"  {'-'*65}")
-print(f"  {'模型':20s} | {'AUC':8s} | {'P-value':10s} | {'Z-stat':8s} | Sig")
-print(f"  {'-'*65}")
-
-delong_results_ext = []
-for model_name in MODELS:
-    if model_name != best_model_name and model_name in model_preds_ext:
-        p_val, z_stat, auc1, auc2 = delong_roc_test(
-            y_true_ext, 
-            model_preds_ext[best_model_name], 
-            model_preds_ext[model_name]
-        )
-        
-        sig_marker = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else 'NS'
-        
-        delong_results_ext.append({
-            'Comparison': f"{best_model_name} vs {model_name}",
-            'Model': model_name,
-            'AUC': auc2,
-            'Best_Model': best_model_name,
-            'Best_Model_AUC': auc1,
-            'AUC_Diff': auc1 - auc2,
-            'Z_Statistic': z_stat,
-            'P_Value': p_val,
-            'Significant': sig_marker
-        })
-        
-        print(f"  {model_name:20s} | {auc2:.4f}  | {p_val:.6f}  | {z_stat:7.4f}  | {sig_marker}")
-
-print(f"  {'-'*65}")
-
-# ------------------------------------------
-# 4.6 保存结果
-# ------------------------------------------
-print(f"\n[5/6] 保存检验结果...")
-
-os.makedirs('figures', exist_ok=True)
-
-# 内部验证 DeLong 结果
-df_delong_int = pd.DataFrame(delong_results_int)
-df_delong_int = df_delong_int.sort_values('AUC', ascending=False)
-df_delong_int.to_csv('figures/DeLong_Test_Results_Internal.csv', index=False)
-print(f"  ✓ 已保存: figures/DeLong_Test_Results_Internal.csv")
-
-# 外部验证 DeLong 结果
-df_delong_ext = pd.DataFrame(delong_results_ext)
-df_delong_ext = df_delong_ext.sort_values('AUC', ascending=False)
-df_delong_ext.to_csv('figures/DeLong_Test_Results_External.csv', index=False)
-print(f"  ✓ 已保存: figures/DeLong_Test_Results_External.csv")
-
-# AUC 汇总表
-summary_data = []
-for model_name in MODELS:
-    summary_data.append({
-        'Model': model_name,
-        'AUC_Internal': auc_scores_int.get(model_name, np.nan),
-        'AUC_External': auc_scores_ext.get(model_name, np.nan),
-        'AUC_Gap': auc_scores_int.get(model_name, 0) - auc_scores_ext.get(model_name, 0)
-    })
-
-df_summary = pd.DataFrame(summary_data)
-df_summary = df_summary.sort_values('AUC_Internal', ascending=False)
-df_summary.to_csv('figures/Model_AUC_Summary.csv', index=False)
-print(f"  ✓ 已保存: figures/Model_AUC_Summary.csv")
-
-# ------------------------------------------
-# 4.7 打印汇总信息
-# ------------------------------------------
-print(f"\n[6/6] 分析完成汇总")
-print(f"{'='*60}")
-print(f"📊 模型性能排名 (按内部验证 AUC):")
-print(f"{'-'*60}")
-for i, row in df_summary.iterrows():
-    gap_indicator = "↓" if row['AUC_Gap'] > 0.05 else "→"
-    print(f"  {row['Model']:20s} | Int: {row['AUC_Internal']:.4f} | Ext: {row['AUC_External']:.4f} | Gap: {row['AUC_Gap']:+.4f} {gap_indicator}")
-print(f"{'-'*60}")
-print(f"✅ DeLong 检验完成!")
-print(f"{'='*60}")
-
-# ------------------------------------------
-# 4.7 绘制多模型 ROC 对比图 
-# ------------------------------------------
-print(f"\n[7/6] 绘制多模型 ROC 对比图...")
-print(f"  ℹ️  内部验证使用 OOF 预测数据（Out-of-Fold Cross-Validation）")
-print(f"  ℹ️  外部验证使用独立外部验证集数据")
-
-fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-
-# ===== 内部验证 ROC (基于 OOF 数据) =====
-
-for i, model_name in enumerate(MODELS):
-    if model_name in model_preds_int:
-        fpr, tpr, _ = roc_curve(y_true_int, model_preds_int[model_name])
-        auc_score = auc(fpr, tpr)
-        
-        axes[0].plot(fpr, tpr, color=MODEL_COLORS[model_name], lw=2, alpha=0.7,
-                    label=f'{model_name} (AUC = {auc_score:.4f})')
-
-axes[0].plot([0, 1], [0, 1], 'k--', alpha=0.3, lw=1)
-axes[0].set_xlabel('1 - Specificity (FPR)')
-axes[0].set_ylabel('Sensitivity (TPR)')
-axes[0].set_title(f'Internal Validation ROC Comparison (OOF)', 
-                 fontsize=13, pad=15)
-axes[0].legend(loc='lower right', fontsize=9, frameon=True, edgecolor='#999999', fancybox=False)
-axes[0].grid(alpha=0.3, linestyle='--')
-axes[0].set_xlim([-0.02, 1.02])
-axes[0].set_ylim([-0.02, 1.02])
-
-# ===== 外部验证 ROC =====
-for i, model_name in enumerate(MODELS):
-    if model_name in model_preds_ext:
-        fpr, tpr, _ = roc_curve(y_true_ext, model_preds_ext[model_name])
-        auc_score = auc(fpr, tpr)
-        
-        axes[1].plot(fpr, tpr, color=MODEL_COLORS[model_name], lw=2, alpha=0.7,
-                    label=f'{model_name} (AUC = {auc_score:.4f})')
-
-axes[1].plot([0, 1], [0, 1], 'k--', alpha=0.3, lw=1)
-axes[1].set_xlabel('1 - Specificity (FPR)')
-axes[1].set_ylabel('Sensitivity (TPR)')
-axes[1].set_title(f'External Validation ROC Comparison', 
-                 fontsize=13, pad=15)
-axes[1].legend(loc='lower right', fontsize=9, frameon=True, edgecolor='#999999', fancybox=False)
-axes[1].grid(alpha=0.3, linestyle='--')
-axes[1].set_xlim([-0.02, 1.02])
-axes[1].set_ylim([-0.02, 1.02])
-
-plt.tight_layout()
-plt.savefig('figures/ROC_MultiModel_Comparison_OOF.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/ROC_MultiModel_Comparison_OOF.png")
-plt.close()
-
-# ------------------------------------------
-# 4.8 绘制 AUC 对比柱状图（带 DeLong 显著性标记）
-# ------------------------------------------
-print(f"\n[8/6] 绘制 AUC 对比柱状图...")
-
-
-fig, axes = plt.subplots(1, 2, figsize=(16, 8)) 
-
-models_sorted_int = sorted(MODELS, key=lambda x: auc_scores_int.get(x, 0), reverse=True)
-models_sorted_ext = sorted(MODELS, key=lambda x: auc_scores_ext.get(x, 0), reverse=True)
-
-# ===== 内部验证柱状图 (基于 OOF 数据) =====
-x_int = np.arange(len(models_sorted_int))
-aucs_int = [auc_scores_int.get(m, 0) for m in models_sorted_int]
-colors_int = [MODEL_COLORS[m] for m in models_sorted_int]
-
-bars_int = axes[0].bar(x_int, aucs_int, color=colors_int, edgecolor='none', linewidth=1.5, alpha=0.8)
-
-# 添加数值标签和显著性标记
-for i, (model_name, auc_val) in enumerate(zip(models_sorted_int, aucs_int)):
-    # 1. 绘制 AUC 数值
-    axes[0].text(i, auc_val + 0.01, f'{auc_val:.3f}', 
-                 ha='center', va='bottom', fontsize=9)
-    
-    # 2. 查找 DeLong 检验结果（基于 OOF 数据）
-    model_result = [r for r in delong_results_int if r['Model'] == model_name]
-    
-    if model_result:
-        sig = model_result[0]['Significant']
-        # 根据显著性绘制不同颜色
-        if sig == 'NS':
-            axes[0].text(i, auc_val + 0.04, 'ns', 
-                        ha='center', va='bottom', color='black', fontsize=10)
-        else:
-            axes[0].text(i, auc_val + 0.04, sig, 
-                        ha='center', va='bottom', color='red')
-        
-
-    elif model_name == best_model_name: 
-        axes[0].text(i, auc_val + 0.04, '(Ref)', 
-                    ha='center', va='bottom', color='blue', fontsize=10)
-
-axes[0].set_xticks(x_int)
-axes[0].set_xticklabels(models_sorted_int, rotation=45, ha='right', fontsize=10)
-axes[0].set_ylabel('AUC')
-
-
-axes[0].set_title(f'Internal Validation AUC Comparison (OOF)', 
-                 fontsize=13, pad=15)
-
-axes[0].set_ylim([0.5, 1.15]) 
-axes[0].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-axes[0].grid(axis='y', linestyle='--', alpha=0.3)
-
-# ===== 外部验证柱状图 =====
-x_ext = np.arange(len(models_sorted_ext))
-aucs_ext = [auc_scores_ext.get(m, 0) for m in models_sorted_ext]
-colors_ext = [MODEL_COLORS[m] for m in models_sorted_ext]
-
-bars_ext = axes[1].bar(x_ext, aucs_ext, color=colors_ext, edgecolor='none', linewidth=1.5, alpha=0.8)
-
-# 添加数值标签和显著性标记
-for i, (model_name, auc_val) in enumerate(zip(models_sorted_ext, aucs_ext)):
-    axes[1].text(i, auc_val + 0.01, f'{auc_val:.3f}', 
-                 ha='center', va='bottom', fontsize=9)
-    
-    model_result = [r for r in delong_results_ext if r['Model'] == model_name]
-    
-    if model_result:
-        sig = model_result[0]['Significant']
-        if sig == 'NS':
-            axes[1].text(i, auc_val + 0.04, 'ns', 
-                        ha='center', va='bottom', color='black', fontsize=10)
-        else:
-            axes[1].text(i, auc_val + 0.04, sig, 
-                        ha='center', va='bottom', color='red')
-        
-
-    elif model_name == best_model_name:
-        axes[1].text(i, auc_val + 0.04, '(Ref)', 
-                    ha='center', va='bottom', color='blue', fontsize=10)
-
-axes[1].set_xticks(x_ext)
-axes[1].set_xticklabels(models_sorted_ext, rotation=45, ha='right', fontsize=10)
-axes[1].set_ylabel('AUC')
-
-axes[1].set_title(f'External Validation AUC Comparison', 
-                 fontsize=13, pad=15)
-
-axes[1].set_ylim([0.5, 1.00])
-axes[1].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-axes[1].grid(axis='y', linestyle='--', alpha=0.3)
-
-# 图例说明
-fig.text(0.5, 0.02, '*** p<0.001, ** p<0.01, * p<0.05, ns: not significant (DeLong test)', 
-         ha='center', fontsize=10, style='italic')
-
-plt.tight_layout(rect=[0, 0.05, 1, 1])
-plt.savefig('figures/AUC_BarChart_with_DeLong_OOF.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/AUC_BarChart_with_DeLong_OOF.png")
-plt.close()
-
-
-# ------------------------------------------
-# 4.9 绘制内外部验证 AUC 对比散点图（泛化能力分析）
-# ------------------------------------------
-print(f"\n[9/6] 绘制泛化能力分析图...")
-print("[泛化能力分析图] 绘制内部 vs 外部 AUC 散点图...")
-
-fig, ax = plt.subplots(figsize=(10, 10))
-
-# ✅ 动态计算坐标轴范围（基于实际数据）
-all_internal = [auc_scores_int[m] for m in MODELS if m in auc_scores_int]
-all_external = [auc_scores_ext[m] for m in MODELS if m in auc_scores_ext]
-
-# 找到最小最大值，留出一点边距
-min_auc = min(min(all_internal), min(all_external)) - 0.02
-max_auc = max(max(all_internal), max(all_external)) + 0.02
-min_auc = max(0.5, min_auc)  # 下限不低于0.5
-max_auc = min(1.0, max_auc)  # 上限不超过1.0
-
-print(f"  📊 AUC范围: [{min_auc:.3f}, {max_auc:.3f}]")
-
-# 绘制对角线（完美泛化线）
-ax.plot([min_auc, max_auc], [min_auc, max_auc], 'k--', alpha=0.5, lw=2,
-        label='Perfect Generalization', zorder=2)
-
-# ✅ 添加泛化容忍区间（±0.02, ±0.05）
-tolerance_005 = 0.02
-tolerance_010 = 0.05
-
-ax.fill_between([min_auc, max_auc],
-                [min_auc - tolerance_005, max_auc - tolerance_005],
-                [min_auc + tolerance_005, max_auc + tolerance_005],
-                color='green', alpha=0.12, label='Excellent (±2%)', zorder=1)
-
-ax.fill_between([min_auc, max_auc],
-                [min_auc - tolerance_010, max_auc - tolerance_010],
-                [min_auc - tolerance_005, max_auc - tolerance_005],
-                color='yellow', alpha=0.12, label='Good (2%-5%)', zorder=1)
-
-ax.fill_between([min_auc, max_auc],
-                [min_auc + tolerance_005, max_auc + tolerance_005],
-                [min_auc + tolerance_010, max_auc + tolerance_010],
-                color='yellow', alpha=0.12, zorder=1)
-
-# ✅ 绘制各模型点（用 label 替代文字标注，避免重叠）
-scatter_data = []
-for model_name in MODELS:
-    if model_name in auc_scores_int and model_name in auc_scores_ext:
-        int_auc = auc_scores_int[model_name]
-        ext_auc = auc_scores_ext[model_name]
-        is_best = (model_name == best_model_name)
-
-        if is_best:
-            size, marker, edgewidth, zorder, alpha = 400, '*', 2.5, 10, 1.0
-        else:
-            size, marker, edgewidth, zorder, alpha = 150, 'o', 1.5, 5, 0.85
-
-        # ✅ label 中包含模型名和 AUC 数值
-        lbl = f"{model_name} (Int:{int_auc:.3f} / Ext:{ext_auc:.3f})"
-        ax.scatter(int_auc, ext_auc, c=[MODEL_COLORS[model_name]],
-                   s=size, marker=marker, edgecolors='black', linewidth=edgewidth,
-                   alpha=alpha, zorder=zorder, label=lbl)
-
-        scatter_data.append((model_name, int_auc, ext_auc, is_best))
-
-# 添加统计信息框（右上角）
-gap = abs(auc_scores_int[best_model_name] - auc_scores_ext[best_model_name])
-stats_text = (
-    f"Best Model: {best_model_name}\n"
-    f"Internal AUC: {auc_scores_int[best_model_name]:.4f}\n"
-    f"External AUC: {auc_scores_ext[best_model_name]:.4f}\n"
-    f"Gap: {gap:.4f}"
-)
-
-ax.text(0.98, 0.98, stats_text, transform=ax.transAxes,
-        fontsize=10, verticalalignment='top', horizontalalignment='right',
-        family='monospace',
-        bbox=dict(boxstyle='round', facecolor='lightyellow',
-                  alpha=0.9, edgecolor='none', linewidth=1.5))
-
-# 图形美化
-ax.set_xlabel('Internal Validation AUC (CV)')
-ax.set_ylabel('External Validation AUC')
-ax.set_title('Generalization Analysis',
-             fontsize=14, pad=15)
-
-# ✅ 使用动态范围
-ax.set_xlim([min_auc - 0.005, max_auc + 0.005])
-ax.set_ylim([min_auc - 0.005, max_auc + 0.005])
-
-ax.grid(alpha=0.15, linewidth=0.5)
-
-# ✅ 统一图例：包含对角线、区域和所有模型点
-ax.legend(loc='lower right', fontsize=8, frameon=True, framealpha=0.95,
-          edgecolor='none', #title='Models & Generalization Quality',
-          title_fontsize=9, ncol=1, markerscale=0.8)
-
-ax.set_aspect('equal')
-
-plt.tight_layout()
-plt.savefig('figures/Generalization_Analysis.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: figures/Generalization_Analysis.png")
-plt.close()
-
-# ------------------------------------------
-# 4.11 生成综合性能汇总表
-# ------------------------------------------
-print(f"\n[11/6] 生成综合性能汇总表...")
-
-summary_data = []
-for model_name in MODELS:
-    row = {'Model': model_name}
-    
-    # AUC 分数
-    row['Internal_AUC'] = auc_scores_int.get(model_name, np.nan)
-    row['External_AUC'] = auc_scores_ext.get(model_name, np.nan)
-    row['AUC_Gap'] = row['Internal_AUC'] - row['External_AUC'] if not np.isnan(row['Internal_AUC']) else np.nan
-    
-    # 内部验证 DeLong 结果
-    model_delong_int = [r for r in delong_results_int if r['Model'] == model_name]
-    if model_delong_int:
-        row['P_Value_Int'] = model_delong_int[0]['P_Value']
-        row['Sig_Int'] = model_delong_int[0]['Significant']
-    elif model_name == best_model:
-        row['P_Value_Int'] = np.nan
-        row['Sig_Int'] = 'Ref'
-    else:
-        row['P_Value_Int'] = np.nan
-        row['Sig_Int'] = 'N/A'
-    
-    # 外部验证 DeLong 结果
-    model_delong_ext = [r for r in delong_results_ext if r['Model'] == model_name]
-    if model_delong_ext:
-        row['P_Value_Ext'] = model_delong_ext[0]['P_Value']
-        row['Sig_Ext'] = model_delong_ext[0]['Significant']
-    elif model_name == best_model:
-        row['P_Value_Ext'] = np.nan
-        row['Sig_Ext'] = 'Ref'
-    else:
-        row['P_Value_Ext'] = np.nan
-        row['Sig_Ext'] = 'N/A'
-    
-    # 泛化评估
-    if not np.isnan(row['AUC_Gap']):
-        if abs(row['AUC_Gap']) < 0.03:
-            row['Generalization'] = 'Excellent'
-        elif abs(row['AUC_Gap']) < 0.05:
-            row['Generalization'] = 'Good'
-        elif abs(row['AUC_Gap']) < 0.10:
-            row['Generalization'] = 'Moderate'
-        else:
-            row['Generalization'] = 'Poor'
-    else:
-        row['Generalization'] = 'N/A'
-    
-    summary_data.append(row)
-
-df_summary = pd.DataFrame(summary_data)
-df_summary = df_summary.sort_values('Internal_AUC', ascending=False)
-
-# 格式化输出
-df_summary_display = df_summary.copy()
-df_summary_display['Internal_AUC'] = df_summary_display['Internal_AUC'].apply(lambda x: f'{x:.4f}' if not np.isnan(x) else 'N/A')
-df_summary_display['External_AUC'] = df_summary_display['External_AUC'].apply(lambda x: f'{x:.4f}' if not np.isnan(x) else 'N/A')
-df_summary_display['AUC_Gap'] = df_summary_display['AUC_Gap'].apply(lambda x: f'{x:+.4f}' if not np.isnan(x) else 'N/A')
-df_summary_display['P_Value_Int'] = df_summary_display['P_Value_Int'].apply(lambda x: f'{x:.4f}' if not np.isnan(x) else '-')
-df_summary_display['P_Value_Ext'] = df_summary_display['P_Value_Ext'].apply(lambda x: f'{x:.4f}' if not np.isnan(x) else '-')
-
-df_summary_display.to_csv('figures/Model_Performance_Summary.csv', index=False)
-print(f"  ✓ 已保存: figures/Model_Performance_Summary.csv")
-
-# 打印到控制台
-print("\n" + "="*100)
-print("📊 模型性能综合汇总")
-print("="*100)
-print(df_summary_display.to_string(index=False))
-print("="*100)
-print("="*100 + "\n")
-
-print(f"{'='*60}")
-print("✅ 多模型性能对比分析完成！")
-print(f"{'='*60}")
-
-# ============================================================================
-# SHAP 分析 
-# ============================================================================
-print(f"{'='*60}")
-print("🔍 开始 SHAP 分析...")
+print(f"  切点: Low <{LOW_CUT:.0%} | Moderate {LOW_CUT:.0%}\u2013{HIGH_CUT:.0%} | High \u2265{HIGH_CUT:.0%}")
+for name, yt, yp, _c in COHORTS:
+    g, p = _risk_groups(yt, yp)
+    rates = " / ".join(
+        f"{x['event_rate']:.1%} [{x['ci_low']:.1%}\u2013{x['ci_high']:.1%}]" for x in g)
+    print(f"  [{name}] 事件率 Low/Moderate/High = {rates}  ({_p_label(p)})")
+
+plot_figure2a()
+plot_figure2b()
 print(f"{'='*60}\n")
 
-# ============================================================================
-# 🎨 SHAP 专用样式
-# ============================================================================
-# 保存当前 rcParams 以便 SHAP 结束后恢复
-_saved_rcParams = mpl.rcParams.copy()
 
-# SHAP 密集图专用较小字号
+# ============================================================
+# 七、特征选择频率可视化（LASSO 棒棒糖图）
+# ============================================================
+print("=" * 60)
+print("🍭 绘制 LASSO 特征选择稳定性棒棒糖图 ...")
+print("=" * 60)
+
+
+def plot_lollipop_chart(data, model_name, title_suffix='', save_path=None):
+    """棒棒糖图：展示 LASSO 在交叉验证中选择每个特征的稳定性"""
+    fig, ax = plt.subplots(figsize=(4.5, max(4, len(data) * 0.4)))
+
+    colors = []
+    for freq in data['Selection_Freq']:
+        if freq >= 0.8:
+            colors.append('#2ecc71')
+        elif freq >= 0.5:
+            colors.append('#f39c12')
+        else:
+            colors.append('#e74c3c')
+
+    y_pos = np.arange(len(data))
+    ax.hlines(y=y_pos, xmin=0, xmax=data['Selection_Freq'],
+              color='gray', alpha=0.4, linewidth=1.2)
+    ax.scatter(data['Selection_Freq'], y_pos,
+               color=colors, s=60, alpha=0.85,
+               edgecolors='white', linewidth=0.8, zorder=4)
+
+    for i, (freq, count, total) in enumerate(zip(
+            data['Selection_Freq'], data['Selection_Count'], data['Total_Folds'])):
+        ax.text(freq + 0.05, i, f'{freq:.1%}', va='center', fontsize=7)
+
+    ax.axvline(x=0.8, color='green', linestyle='--', alpha=0.3, label='High Stability (80%)')
+    ax.axvline(x=0.5, color='orange', linestyle='--', alpha=0.3, label='Medium Stability (50%)')
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(data['Feature'], fontsize=10)
+    ax.set_xlabel('LASSO Selection Frequency')
+    ax.set_xlim(0, 1.15)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    sci_legend(ax, loc='lower right')
+    ax.grid(axis='x', alpha=0.15, linewidth=0.5)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
+        plt.savefig(save_path.replace('.png', '.pdf'), bbox_inches='tight')
+    plt.close()
+
+
+try:
+    # ---------- 数据加载 ----------
+    package = joblib.load(f"{DATA_PATH}/Model_Package_{TIMESTAMP}.pkl")
+    best_model_name_lp = package['best_model_name']
+    freq_df = pd.read_csv(f"{DATA_PATH}/Feature_Selection_Frequency_{TIMESTAMP}.csv")
+    rename_df_feature_col(freq_df)                     # ✅ 映射为 SCI 展示标签
+
+    SCENARIOS = {
+        'Original Preop Model': {
+            'timestamp': TIMESTAMP,
+            'package': package,
+            'best_model': best_model_name_lp,
+            'freq_df': freq_df,
+        },
+    }
+
+    # ---------- 敏感性分析模型（可选）----------
+    try:
+        pkg_intra   = joblib.load(f"{DATA_PATH}/Sensitivity_Model_Package_latest.pkl")
+
+        best_intra   = pkg_intra['best_model_name']
+
+        freq_intra   = pd.read_csv(f"{DATA_PATH}/Feature_Selection_Frequency_{TIMESTAMP_INTRA}.csv")
+        rename_df_feature_col(freq_intra)              # ✅ 映射为 SCI 展示标签
+
+        SCENARIOS['Pre+Intraoperative Model'] = {
+            'timestamp': TIMESTAMP_INTRA, 'package': pkg_intra,
+            'best_model': best_intra, 'freq_df': freq_intra,
+        }
+        
+        print(f"  术中模型: {best_intra}, 特征数: {len(freq_intra[freq_intra['Model']==best_intra])}")
+    except FileNotFoundError as e:
+        print(f"  ⚠️ 敏感性分析数据缺失（{e}），仅绘制主模型棒棒糖图。")
+
+    print(f"  主模型: {best_model_name_lp}, "
+          f"特征数: {len(freq_df[freq_df['Model']==best_model_name_lp])}")
+
+    # ---------- 逐场景出图 ----------
+    for label, cfg in SCENARIOS.items():
+        df_sub = cfg['freq_df']
+        df_sub = df_sub[df_sub['Model'] == cfg['best_model']].copy()
+        df_sub = df_sub.sort_values('Selection_Freq', ascending=True)
+        safe = label.replace(' ', '_').replace('+', '')
+        plot_lollipop_chart(df_sub, cfg['best_model'],
+                            title_suffix=f'{label}',
+                            save_path=f'figures/LASSO_Lollipop_{safe}.png')
+        print(f"  ✅ Lollipop saved: {label}")
+
+except FileNotFoundError as e:
+    print(f"  ⚠️ 跳过棒棒糖图（缺少文件）: {e}")
+
+
+# ============================================================================
+# 八、SHAP 解释性分析
+#   ⚠️ 本模块与截距校准无关；阈值一律使用原始尺度 clinical_threshold
+# ============================================================================
+
+# ---------- SHAP 密集图专用较小字号（局部覆盖 set_sci_style）----------
 SHAP_STYLE = {
     'font.family':        'Arial',
     'font.size':          8,
@@ -3159,23 +1744,44 @@ SHAP_STYLE = {
     'savefig.pad_inches': 0.05,
     'figure.dpi':         150,
 }
-mpl.rcParams.update(SHAP_STYLE)
 
-# ---------- 统一配色 ----------
-# 主色板 (来自 Nature / Lancet 风格)
+# SHAP 局部样式覆盖（在 set_sci_style 基础上最小修改）
+SHAP_RC = {
+    'font.size':            8,
+    'axes.titlesize':       9,
+    'axes.labelsize':       9,
+    'xtick.labelsize':      7,
+    'ytick.labelsize':      8,
+    'axes.linewidth':       0.8,
+    'axes.spines.top':      False,
+    'axes.spines.right':    False,
+    'xtick.major.width':    0.8,
+    'ytick.major.width':    0.8,
+    'xtick.major.size':     3.5,
+    'ytick.major.size':     3.5,
+    'xtick.minor.visible':  False,
+    'ytick.minor.visible':  False,
+    'axes.grid':            False,
+    'legend.frameon':       False,
+    'savefig.dpi':          600,
+    'savefig.bbox':         'tight',
+    'savefig.pad_inches':   0.05,
+}
+
+# ---------- 统一配色（Nature / Lancet 风格）----------
 C_BLUE    = '#2166AC'
 C_RED     = '#B2182B'
 C_GREEN   = '#1B7837'
 C_ORANGE  = '#E08214'
 C_GRAY    = '#636363'
 C_LIGHT   = '#D9D9D9'
+C_POS     = '#D6604D'          # 正向 (风险↑)
+C_NEG     = '#4393C3'          # 负向 (保护↓)
+C_BAR     = COLORS_LIST[1]     # 条形填充
+C_ANNOT   = '#636363'          # 灰色 — 数值标注文字
 
-# 正/负 SHAP 专用色
-C_POS     = '#D6604D'   # 正向 (风险↑)
-C_NEG     = '#4393C3'   # 负向 (保护↓)
-
-DPI = 600
-os.makedirs('figures/SHAP_Dependence', exist_ok=True)
+AL_RAW_KEY = 'AL'              # 建模时眼轴长的原始（未标准化）列名
+N_BOOT_AL  = 500               # 依赖图 bootstrap 次数
 
 
 # ---------- 辅助函数 ----------
@@ -3194,4128 +1800,3182 @@ def sci_ax(ax, xlabel='', ylabel='', title=''):
     ax.tick_params(axis='both', labelsize=7, width=0.6)
 
 
-# ------------------------------------------
-# 步骤 0: 加载SHAP专用数据包
-# ------------------------------------------
-print("[0/9] 加载SHAP分析数据包...")
+def run_shap_module():
+    """完整 SHAP 分析与出图（Panel G/H、Fig3A–3D、眼轴长依赖图）"""
 
-import glob
-shap_files = glob.glob(f"{DATA_PATH}/SHAP_Analysis_Data_{TIMESTAMP}.pkl")
-if not shap_files:
-    raise FileNotFoundError("❌ 未找到SHAP数据包！请先运行建模代码。")
+    print(f"\n{'='*60}")
+    print("🔍 开始 SHAP 分析...")
+    print(f"{'='*60}\n")
 
-latest_shap_file = max(shap_files, key=os.path.getctime)
-print(f"  📦 加载: {os.path.basename(latest_shap_file)}")
+    # 保存当前 rcParams 以便 SHAP 结束后恢复
+    _saved_rcParams = mpl.rcParams.copy()
+    mpl.rcParams.update(SHAP_STYLE)
 
-shap_package = joblib.load(latest_shap_file)
+    os.makedirs('figures/SHAP_Dependence', exist_ok=True)
 
-X_train_transformed = shap_package['X_train_transformed']
-X_ext_transformed = shap_package['X_ext_transformed']
-feature_names = shap_package['feature_names']
-# ✅ 映射为 SCI 展示标签
-feature_names = rename_feature_list(feature_names)
-classifier = shap_package['best_model_step']
-optimal_threshold = shap_package['optimal_threshold']
-assert shap_package['optimal_threshold'] == optimal_threshold, \
-    f"阈值不一致! shap={shap_package['optimal_threshold']}, main={optimal_threshold}"
-
-print(f"  ✓ 训练集: {X_train_transformed.shape}")
-print(f"  ✓ 外部验证集: {X_ext_transformed.shape}")
-print(f"  ✓ 特征数量: {len(feature_names)}")
-print(f"  ✓ 分类器类型: {type(classifier).__name__}")
-
-y_train = full_package['y_train']
-y_ext = full_package['y_external']
-
-# ------------------------------------------
-# 步骤 1: 准备 SHAP 分析数据
-# ------------------------------------------
-print("\n[1/9] 准备 SHAP 分析数据...")
-
-X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
-X_ext_df = pd.DataFrame(X_ext_transformed, columns=feature_names)
-
-print(f"  ✓ 训练集特征矩阵: {X_train_df.shape}")
-print(f"  ✓ 外部验证集特征矩阵: {X_ext_df.shape}")
-print(f"  ✓ 特征数量: {len(feature_names)}")
-
-SHAP_SAMPLE_SIZE = 1000
-if len(X_train_df) > SHAP_SAMPLE_SIZE:
-    print(f"  ℹ️ 样本量较大，随机采样 {SHAP_SAMPLE_SIZE} 个样本进行分析...")
-    from sklearn.model_selection import train_test_split
-    X_sample, _, y_sample, _ = train_test_split(
-        X_train_df, y_train,
-        train_size=SHAP_SAMPLE_SIZE,
-        stratify=y_train,
-        random_state=42
-    )
-else:
-    X_sample = X_train_df
-    y_sample = y_train
-    print(f"  ✓ 使用全部 {len(X_sample)} 个样本")
-
-# ------------------------------------------
-# 步骤 2: 创建 SHAP 解释器
-# ------------------------------------------
-print("\n[2/9] 创建 SHAP 解释器...")
-
-actual_classifier = classifier
-print(f"  ✓ 模型类型: {type(actual_classifier).__name__}")
-print(f"  🔍 是否有 predict_proba: {hasattr(actual_classifier, 'predict_proba')}")
-print(f"  🔍 是否有 decision_function: {hasattr(actual_classifier, 'decision_function')}")
-
-model_type = type(actual_classifier).__name__
-print(f"  ✓ 实际用于SHAP的模型: {model_type}")
-
-if model_type in ['LinearSVC', 'SVC']:
-    print(f"  ℹ️ 使用 LinearExplainer (SVM模式)...")
     try:
-        explainer = shap.LinearExplainer(
-            actual_classifier, X_sample,
-            feature_perturbation="interventional"
-        )
-        print("  ✓ LinearExplainer 创建完成")
-    except Exception as e:
-        print(f"  ⚠️ LinearExplainer 失败 ({e})，转为 KernelExplainer...")
-        if hasattr(actual_classifier, 'decision_function'):
-            from scipy.special import expit
-            predict_fn = lambda x: expit(actual_classifier.decision_function(x))
-            print("  ✓ 使用 decision_function + sigmoid")
+        # ------------------------------------------
+        # 步骤 0: 加载 SHAP 专用数据包
+        # ------------------------------------------
+        print("[0/9] 加载 SHAP 分析数据包...")
+
+        shap_files = glob.glob(f"{DATA_PATH}/SHAP_Analysis_Data_{TIMESTAMP}.pkl")
+        if not shap_files:
+            raise FileNotFoundError("❌ 未找到 SHAP 数据包！请先运行建模代码。")
+
+        latest_shap_file = max(shap_files, key=os.path.getctime)
+        print(f"  📦 加载: {os.path.basename(latest_shap_file)}")
+
+        shap_package = joblib.load(latest_shap_file)
+
+        X_train_transformed = shap_package['X_train_transformed']
+        X_ext_transformed   = shap_package['X_ext_transformed']
+        feature_names       = shap_package['feature_names']
+
+        # 稳健重命名：rename_feature_list 无效时，用 rename_feature 逐个兜底
+        _raw  = list(feature_names)
+        _disp = list(rename_feature_list(_raw))
+        if _disp == _raw:                              # 没改成功
+            _disp = [rename_feature(f) for f in _raw]
+        feature_names = _disp
+        print("✓ 展示标签:", feature_names)
+
+        classifier = shap_package['best_model_step']
+
+        # 阈值一致性检查（原始概率尺度，不做任何校准）
+        assert np.isclose(shap_package['optimal_threshold'], clinical_threshold), \
+            (f"阈值不一致! shap={shap_package['optimal_threshold']}, "
+             f"main={clinical_threshold}")
+
+        print(f"  ✓ 训练集: {X_train_transformed.shape}")
+        print(f"  ✓ 外部验证集: {X_ext_transformed.shape}")
+        print(f"  ✓ 特征数量: {len(feature_names)}")
+        print(f"  ✓ 分类器类型: {type(classifier).__name__}")
+
+        y_train    = Y_TRAIN
+        y_ext_shap = Y_EXT_PKG
+
+        # ------------------------------------------
+        # 步骤 1: 准备 SHAP 分析数据
+        # ------------------------------------------
+        print("\n[1/9] 准备 SHAP 分析数据...")
+
+        X_train_df = pd.DataFrame(X_train_transformed, columns=feature_names)
+        X_ext_df   = pd.DataFrame(X_ext_transformed,   columns=feature_names)
+
+        print(f"  ✓ 训练集特征矩阵: {X_train_df.shape}")
+        print(f"  ✓ 外部验证集特征矩阵: {X_ext_df.shape}")
+
+        SHAP_SAMPLE_SIZE = 1000
+        if len(X_train_df) > SHAP_SAMPLE_SIZE:
+            print(f"  ℹ️ 样本量较大，随机采样 {SHAP_SAMPLE_SIZE} 个样本进行分析...")
+            from sklearn.model_selection import train_test_split
+            X_sample, _, y_sample, _ = train_test_split(
+                X_train_df, y_train,
+                train_size=SHAP_SAMPLE_SIZE,
+                stratify=y_train,
+                random_state=42
+            )
         else:
-            raise ValueError("SVM模型没有decision_function")
-        background_data = X_sample.sample(min(100, len(X_sample)), random_state=42)
-        explainer = shap.KernelExplainer(predict_fn, background_data)
-
-elif model_type in ['RandomForestClassifier', 'XGBClassifier', 'LGBMClassifier']:
-    print(f"  ℹ️ 使用 TreeExplainer...")
-    explainer = shap.TreeExplainer(actual_classifier)
-    print("  ✓ TreeExplainer 创建完成")
-
-else:
-    print(f"  ℹ️ 使用 KernelExplainer (通用模式)...")
-    print("  ⏳ 初始化中（需要几分钟）...")
-    background_data = X_sample.sample(min(200, len(X_sample)), random_state=42)
-
-    if hasattr(actual_classifier, 'predict_proba'):
-        predict_fn = lambda x: actual_classifier.predict_proba(x)[:, 1]
-        print("  ✓ 使用 predict_proba")
-    elif hasattr(actual_classifier, 'decision_function'):
-        from scipy.special import expit
-        predict_fn = lambda x: expit(actual_classifier.decision_function(x))
-        print("  ✓ 使用 decision_function + sigmoid")
-    else:
-        raise ValueError("模型没有predict_proba或decision_function")
-
-    test_pred = predict_fn(background_data.iloc[:5].values)
-    print(f"  🔍 预测测试: {test_pred}")
-    print(f"  🔍 预测范围: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
-
-    explainer = shap.KernelExplainer(predict_fn, background_data)
-    print("  ✓ KernelExplainer 创建完成")
-
-# ------------------------------------------
-# 步骤 3: 计算 SHAP 值
-# ------------------------------------------
-print("\n[3/9] 计算 SHAP 值...")
-print("  ⏳ 这可能需要几分钟...")
-
-explainer_type = type(explainer).__name__
-print(f"  ℹ️ Explainer类型: {explainer_type}")
-
-if "Tree" in explainer_type:
-    shap_values = explainer(X_sample, check_additivity=False)
-elif "Linear" in explainer_type:
-    shap_values = explainer(X_sample)
-else:
-    print(f"  ℹ️ 检测到 {explainer_type}，使用兼容模式计算...")
-    raw_values = explainer.shap_values(X_sample)
-
-    if isinstance(raw_values, list):
-        vals = raw_values[1]
-        base_val = explainer.expected_value[1]
-    else:
-        vals = raw_values
-        base_val = explainer.expected_value
-
-    shap_values = shap.Explanation(
-        values=vals,
-        base_values=base_val,
-        data=X_sample.values,
-        feature_names=list(feature_names)
-    )
-    print(f"  🔍 SHAP值范围: [{vals.min():.4f}, {vals.max():.4f}]")
-    print(f"  🔍 SHAP值均值: {np.abs(vals).mean():.4f}")
-    print(f"  🔍 非零SHAP值: {(np.abs(vals) > 1e-6).sum()} / {vals.size}")
-
-# 提取正类 SHAP 值
-shap_values_pos = shap_values
-if len(shap_values.values.shape) == 3:
-    print("  ✓ 检测到多维 SHAP 值，正在提取正类...")
-    shap_values_pos = shap.Explanation(
-        values=shap_values.values[:, :, 1],
-        base_values=shap_values.base_values[:, 1] if shap_values.base_values.ndim > 1 else shap_values.base_values,
-        data=shap_values.data,
-        feature_names=shap_values.feature_names
-    )
-
-print(f"  ✓ 最终 SHAP 值矩阵形状: {shap_values_pos.values.shape}")
-
-if np.abs(shap_values_pos.values).max() < 1e-6:
-    print("  ⚠️⚠️⚠️ 警告：所有SHAP值接近0！模型可能有问题！")
-else:
-    print("  ✓ SHAP值计算成功！")
-
-# ============================================================================
-# 📊 步骤 4 – 14: 出图
-# ============================================================================
-import os
-import numpy as np
-import pandas as pd
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import shap
-import warnings
-warnings.filterwarnings('ignore')
-
-os.makedirs('figures', exist_ok=True)
-
-C_BAR     = COLORS_LIST[1]   
-C_ANNOT   = '#636363'        # 灰色 — 数值标注文字
-
-# ── 准备数据 ──────────────────────────────────────────────────
-pred_probs = classifier.predict_proba(X_sample)[:, 1]
-high_risk_idx = np.argmax(pred_probs)
-low_risk_idx  = np.argmin(pred_probs)
-high_risk_prob = pred_probs[high_risk_idx]
-low_risk_prob  = pred_probs[low_risk_idx]
-
-mean_abs_shap = np.abs(shap_values_pos.values).mean(axis=0)
-importance_df = pd.DataFrame({
-    'Feature': feature_names,
-    'SHAP_Importance': mean_abs_shap
-}).sort_values('SHAP_Importance', ascending=False)
-
-print(f"  High-risk sample: idx={high_risk_idx}, prob={high_risk_prob:.4f}")
-print(f"  Low-risk  sample: idx={low_risk_idx},  prob={low_risk_prob:.4f}")
-
-
-# ══════════════════════════════════════════════════════════════
-# Panel A — SHAP Summary Beeswarm
-# ══════════════════════════════════════════════════════════════
-print("\n[Panel A] SHAP Summary Beeswarm...")
-
-fig_a, ax_a = plt.subplots(figsize=(5.5, 3))
-
-shap.summary_plot(
-    shap_values_pos.values,
-    X_sample,
-    feature_names=feature_names,
-    show=False,
-    max_display=20,
-    plot_size=None,
-    color_bar=True,
-)
-
-ax_a = plt.gca()
-sci_ax(ax_a, xlabel='SHAP value', ylabel='')
-ax_a.set_title('SHAP Summary', fontsize=9, pad=8)
-
-# colorbar 美化
-if len(fig_a.axes) > 1:
-    cbar_ax = fig_a.axes[-1]
-    cbar_ax.tick_params(labelsize=6)
-    cbar_ax.set_ylabel('Feature value', fontsize=7, labelpad=3)
-
-plt.tight_layout()
-plt.savefig('figures/Fig3A_SHAP_Summary.png', dpi=DPI, bbox_inches='tight')
-plt.savefig('figures/Fig3A_SHAP_Summary.pdf', bbox_inches='tight')
-print("  ✓ Fig3A_SHAP_Summary.png/.pdf")
-plt.close()
-
-
-# ══════════════════════════════════════════════════════════════
-# Panel B — Feature Importance 
-# ══════════════════════════════════════════════════════════════
-print("\n[Panel B] Feature Importance...")
-
-fig_b, ax_b = plt.subplots(figsize=(5.5, 3))
-
-top_n = min(10, len(importance_df))
-imp_plot = importance_df.head(top_n).iloc[::-1]
-
-bars = ax_b.barh(
-    range(len(imp_plot)),
-    imp_plot['SHAP_Importance'],
-    color=C_BAR,
-    edgecolor='white',
-    linewidth=0.3,
-    height=0.65,
-    alpha=0.85,
-)
-
-ax_b.set_yticks(range(len(imp_plot)))
-ax_b.set_yticklabels(imp_plot['Feature'], fontsize=7)
-sci_ax(ax_b, xlabel='Mean |SHAP value|')
-ax_b.set_title('Feature Importance', fontsize=9, pad=8)
-
-# 数值标注 (统一 4 位小数)
-x_max = imp_plot['SHAP_Importance'].max()
-for i, (bar, val) in enumerate(zip(bars, imp_plot['SHAP_Importance'])):
-    ax_b.text(val + x_max * 0.025, i,
-              f'{val:.4f}', va='center', fontsize=6.5, color=C_ANNOT)
-
-plt.tight_layout()
-plt.savefig('figures/Fig3B_Feature_Importance.png', dpi=DPI, bbox_inches='tight')
-plt.savefig('figures/Fig3B_Feature_Importance.pdf', bbox_inches='tight')
-print("  ✓ Fig3B_Feature_Importance.png/.pdf")
-plt.close()
-
-
-# ══════════════════════════════════════════════════════════════
-# Panel C — Waterfall (High-risk)
-# ══════════════════════════════════════════════════════════════
-print(f"\n[Panel C] Waterfall — High-risk (prob={high_risk_prob:.3f})...")
-
-fig_c = plt.figure(figsize=(5, 3))
-shap.waterfall_plot(shap_values_pos[high_risk_idx], show=False, max_display=15)
-
-all_ax_c = fig_c.get_axes()
-ax_c = all_ax_c[0]
-ax_c.set_title(
-    f'High-risk sample (Predicted Probability = {high_risk_prob:.3f})',
-    fontsize=10, pad=10
-)
-despine(ax_c)
-
-for a in all_ax_c:
-    a.tick_params(labelsize=8)
-    for txt in a.texts:
-        txt.set_fontsize(8)
-
-
-if len(all_ax_c) > 2:
-    for label in all_ax_c[2].get_xticklabels()[1:]:
-        label.set_visible(False)
-
-plt.tight_layout()
-plt.savefig('figures/Fig3C_Waterfall_HighRisk.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ Fig3C_Waterfall_HighRisk.png/.pdf")
-plt.close()
-
-
-# ══════════════════════════════════════════════════════════════
-# Panel D — Waterfall (Low-risk)
-# ══════════════════════════════════════════════════════════════
-print(f"\n[Panel D] Waterfall — Low-risk (prob={low_risk_prob:.3f})...")
-
-fig_d = plt.figure(figsize=(5, 3))
-shap.waterfall_plot(shap_values_pos[low_risk_idx], show=False, max_display=15)
-
-all_ax_d = fig_d.get_axes()
-ax_d = all_ax_d[0]
-ax_d.set_title(
-    f'Low-risk sample (Predicted Probability = {low_risk_prob:.3f})',
-    fontsize=10, pad=10
-)
-despine(ax_d)
-
-for a in all_ax_d:
-    a.tick_params(labelsize=8)
-    for txt in a.texts:
-        txt.set_fontsize(8)
-
-if len(all_ax_d) > 2:
-    for label in all_ax_d[2].get_xticklabels()[1:]:
-        label.set_visible(False)
-
-plt.tight_layout()
-plt.savefig('figures/Fig3D_Waterfall_LowRisk.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ Fig3D_Waterfall_LowRisk.png/.pdf")
-plt.close()
-
-# ------------------------------------------
-# 步骤 4: SHAP Summary Plot (蜂群图)
-# ------------------------------------------
-print("\n[4/14] 绘制 SHAP Summary Plot (蜂群图)...")
-
-fig, ax = plt.subplots(figsize=(6, 3))
-
-shap.summary_plot(
-    shap_values_pos.values,
-    X_sample,
-    feature_names=feature_names,
-    show=False,
-    max_display=20,
-    color_bar=True,
-    plot_size=None,       # 由外部 fig 控制
-)
-
-# 获取当前 axes 并美化
-ax = plt.gca()
-sci_ax(ax, xlabel='SHAP value', ylabel='')
-ax.set_title('SHAP Summary', fontsize=9,  pad=8)
-
-# 调整 colorbar 字号
-for child in fig.get_children():
-    if isinstance(child, mpl.colorbar.Colorbar) or hasattr(child, 'set_label'):
-        pass
-# colorbar 文字可通过 fig.axes 获取
-if len(fig.axes) > 1:
-    cbar_ax = fig.axes[-1]
-    cbar_ax.tick_params(labelsize=6)
-    cbar_ax.set_ylabel('Feature value', fontsize=7)
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Summary_Beeswarm.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Summary_Beeswarm.png")
-plt.close()
-
-# ------------------------------------------
-# 步骤 5: SHAP Feature Importance (自定义条形图)
-# ------------------------------------------
-print("\n[5/14] 绘制 SHAP Feature Importance...")
-
-mean_abs_shap = np.abs(shap_values_pos.values).mean(axis=0)
-importance_df = pd.DataFrame({
-    'Feature': feature_names,
-    'SHAP_Importance': mean_abs_shap
-}).sort_values('SHAP_Importance', ascending=False)
-
-from matplotlib.colors import LinearSegmentedColormap
-import matplotlib.cm as cm
-
-# 自定义蓝→紫→红渐变，与蜂群图一致
-cmap = LinearSegmentedColormap.from_list(
-    'blue_purple_red', ["#008AFB", "#9D28B0", "#FF0554"], N=256
-)
-# cmap = shap.plots.colors.red_blue
-
-fig, ax = plt.subplots(figsize=(6, 3))
-top_n = min(8, len(importance_df))
-importance_top = importance_df.head(top_n).iloc[::-1]  # 最重要的在上
-
-# 归一化 → 映射颜色
-norm = plt.Normalize(
-    vmin=importance_top['SHAP_Importance'].min(),
-    vmax=importance_top['SHAP_Importance'].max()
-)
-colors = [cmap(norm(v)) for v in importance_top['SHAP_Importance']]
-
-# 条形高度随重要性缩放（0.35 ~ 0.75）
-heights = 0.35 + 0.4 * norm(importance_top['SHAP_Importance'].values)
-
-bars = ax.barh(
-    range(len(importance_top)),
-    importance_top['SHAP_Importance'],
-    color=colors,
-    edgecolor='white', linewidth=0.3,
-    height=heights
-)
-
-ax.set_yticks(range(len(importance_top)))
-ax.set_yticklabels(importance_top['Feature'], fontsize=7)
-sci_ax(ax, xlabel='Mean |SHAP value|', title='Feature Importance')
-
-for i, (bar, val) in enumerate(zip(bars, importance_top['SHAP_Importance'])):
-    ax.text(val + importance_top['SHAP_Importance'].max() * 0.02, i,
-            f'{val:.4f}', va='center', fontsize=6, color='#555555')
-
-# 添加colorbar与蜂群图呼应
-sm = cm.ScalarMappable(cmap=cmap, norm=norm)
-sm.set_array([])
-cbar = plt.colorbar(sm, ax=ax, shrink=0.6, aspect=20, pad=0.02)
-cbar.set_label('Importance', fontsize=7)
-cbar.ax.tick_params(labelsize=6)
-cbar.outline.set_visible(False)
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Importance_Bar.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Importance_Bar.png")
-plt.close()
-
-importance_df.to_csv('figures/SHAP_Importance.csv', index=False)
-print("  ✓ 已保存: figures/SHAP_Importance.csv")
-
-print("\n  Top 10 最重要特征:")
-for idx, row in importance_df.head(10).iterrows():
-    print(f"    {idx+1:2d}. {row['Feature']:30s} {row['SHAP_Importance']:.6f}")
-
-# ------------------------------------------
-# 步骤 6: SHAP Bar Plot (官方条形图)
-# ------------------------------------------
-print("\n[6/14] 绘制 SHAP Bar Plot...")
-
-fig, ax = plt.subplots(figsize=(4.5, 3))
-
-shap.summary_plot(
-    shap_values_pos.values,
-    X_sample,
-    feature_names=feature_names,
-    plot_type='bar',
-    show=False,
-    max_display=20,
-    plot_size=None,
-)
-
-ax = plt.gca()
-sci_ax(ax, xlabel='Mean |SHAP value|', title='Feature Importance (SHAP)')
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Bar_Official.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Bar_Official.png")
-plt.close()
-
-# ------------------------------------------
-# 步骤 7: SHAP Waterfall Plot (瀑布图)
-# ------------------------------------------
-print("\n[7/14] 绘制 SHAP Waterfall Plot (高风险&低风险样本)...")
-
-pred_probs = classifier.predict_proba(X_sample)[:, 1]
-high_risk_idx = np.argmax(pred_probs)
-low_risk_idx = np.argmin(pred_probs)
-high_risk_prob = pred_probs[high_risk_idx]
-low_risk_prob = pred_probs[low_risk_idx]
-
-print(f"  ✓ 高风险样本: #{high_risk_idx}, 预测概率: {high_risk_prob:.4f}")
-print(f"  ✓ 低风险样本: #{low_risk_idx}, 预测概率: {low_risk_prob:.4f}")
-
-# 高风险样本
-fig = plt.figure(figsize=(5, 3))
-shap.waterfall_plot(shap_values_pos[high_risk_idx], show=False, max_display=15)
-
-all_axes = fig.get_axes()
-ax = all_axes[0]
-
-ax.set_title(f'High-risk sample (Pred Prob = {high_risk_prob:.3f})',
-             fontsize=9,  pad=10)
-despine(ax, top=True, right=True)
-
-# 统一所有 axes 的字号
-for a in all_axes:
-    a.tick_params(labelsize=8)
-    for txt in a.texts:
-        txt.set_fontsize(8)
-
-# 修复顶部 x 轴重复标签
-if len(all_axes) > 2:
-    top_labels = all_axes[2].get_xticklabels()
-    if len(top_labels) > 1:
-        for label in top_labels[1:]:
-            label.set_visible(False)
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Waterfall_HighRisk.png', dpi=DPI, bbox_inches='tight')
-plt.close()
-
-# 低风险样本
-fig = plt.figure(figsize=(5, 3))
-shap.waterfall_plot(shap_values_pos[low_risk_idx], show=False, max_display=15)
-
-all_axes = fig.get_axes()
-ax = all_axes[0]
-
-ax.set_title(f'Low-risk sample (Pred Prob = {low_risk_prob:.3f})',
-             fontsize=9,  pad=10)
-despine(ax, top=True, right=True)
-
-# 统一所有 axes 的字号
-for a in all_axes:
-    a.tick_params(labelsize=8)
-    for txt in a.texts:
-        txt.set_fontsize(8)
-
-# 修复顶部 x 轴重复标签
-if len(all_axes) > 2:
-    top_labels = all_axes[2].get_xticklabels()
-    if len(top_labels) > 1:
-        for label in top_labels[1:]:
-            label.set_visible(False)
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Waterfall_LowRisk.png', dpi=DPI, bbox_inches='tight')
-plt.close()
-
-# ------------------------------------------
-# 步骤 8: SHAP Dependence Plots
-# ------------------------------------------
-print("\n[8/14] 绘制 SHAP Dependence Plots...")
-
-top_features = importance_df['Feature'].head(5).tolist()
-print(f"  ✓ 选择特征: {', '.join(top_features)}")
-
-for idx, feat in enumerate(top_features):
-    feat_idx = list(feature_names).index(feat)
-    try:
-        fig, ax = plt.subplots(figsize=(4, 3.2))
-        shap.dependence_plot(
-            feat_idx,
+            X_sample = X_train_df
+            y_sample = y_train
+            print(f"  ✓ 使用全部 {len(X_sample)} 个样本")
+
+        # ------------------------------------------
+        # 步骤 2: 创建 SHAP 解释器
+        # ------------------------------------------
+        print("\n[2/9] 创建 SHAP 解释器...")
+
+        actual_classifier = classifier
+        print(f"  ✓ 模型类型: {type(actual_classifier).__name__}")
+        print(f"  🔍 是否有 predict_proba: {hasattr(actual_classifier, 'predict_proba')}")
+        print(f"  🔍 是否有 decision_function: {hasattr(actual_classifier, 'decision_function')}")
+
+        model_type = type(actual_classifier).__name__
+
+        # ============================================================
+        # 线性模型 SHAP 输出尺度开关
+        #   "logodds"     -> LinearExplainer：SHAP 值在对数几率(log-odds)尺度，
+        #                    解析解、精确、秒级完成，是逻辑回归的理论正确解释空间。
+        #                    可加性：sum(shap)+base == logit(p) == decision_function
+        #   "probability" -> KernelExplainer 解释 predict_proba：SHAP 值在概率尺度，
+        #                    对临床更直观（"该特征使预测风险 +0.15"），但为近似值。
+        #                    可加性：sum(shap)+base == p == predict_proba
+        # ⚠️ 两种尺度的数值范围/图轴含义不同，切换后所有 SHAP 数值都会随之改变。
+        # ============================================================
+        SHAP_LINEAR_OUTPUT_SPACE = "logodds"      # 可改为 "probability"
+
+        LINEAR_MODELS = [
+            'LogisticRegression', 'LogisticRegressionCV',
+            'RidgeClassifier', 'RidgeClassifierCV',
+            'SGDClassifier', 'Perceptron', 'LinearDiscriminantAnalysis',
+        ]
+
+        if model_type in ['LinearSVC', 'SVC']:
+            print("  ℹ️ 使用 LinearExplainer (SVM模式)...")
+            try:
+                explainer = shap.LinearExplainer(
+                    actual_classifier, X_sample,
+                    feature_perturbation="interventional"
+                )
+                print("  ✓ LinearExplainer 创建完成")
+            except Exception as e:
+                print(f"  ⚠️ LinearExplainer 失败 ({e})，转为 KernelExplainer...")
+                if hasattr(actual_classifier, 'decision_function'):
+                    predict_fn = lambda x: expit(actual_classifier.decision_function(x))
+                    print("  ✓ 使用 decision_function + sigmoid")
+                else:
+                    raise ValueError("SVM模型没有decision_function")
+                background_data = X_sample.sample(min(100, len(X_sample)), random_state=42)
+                explainer = shap.KernelExplainer(predict_fn, background_data)
+
+        elif model_type in LINEAR_MODELS and SHAP_LINEAR_OUTPUT_SPACE == "logodds":
+            # ✅ 逻辑回归等线性模型：LinearExplainer（解析解，精确且秒级完成）
+            print(f"  ℹ️ 检测到线性模型 {model_type}，使用 LinearExplainer (线性模型模式)...")
+            print("  ⚠️ SHAP 值在 log-odds(对数几率)尺度；可加性 sum(shap)+base = logit(p)")
+            explainer = shap.LinearExplainer(
+                actual_classifier, X_sample,
+                feature_perturbation="interventional"
+            )
+            _base = float(np.ravel(explainer.expected_value)[0])
+            print(f"  ✓ LinearExplainer 创建完成 (base/期望值 = {_base:.4f} log-odds)")
+
+        elif model_type in ['RandomForestClassifier', 'XGBClassifier', 'LGBMClassifier']:
+            print("  ℹ️ 使用 TreeExplainer...")
+            explainer = shap.TreeExplainer(actual_classifier)
+            print("  ✓ TreeExplainer 创建完成")
+
+        else:
+            # 通用 / 概率尺度：KernelExplainer 解释 predict_proba（近似值）
+            if model_type in LINEAR_MODELS:
+                print(f"  ℹ️ 线性模型 {model_type}，按概率尺度输出 → KernelExplainer(predict_proba)...")
+            else:
+                print("  ℹ️ 使用 KernelExplainer (通用模式)...")
+            print("  ⏳ 初始化中（需要几分钟）...")
+            background_data = X_sample.sample(min(200, len(X_sample)), random_state=42)
+
+            if hasattr(actual_classifier, 'predict_proba'):
+                predict_fn = lambda x: actual_classifier.predict_proba(x)[:, 1]
+                print("  ✓ 使用 predict_proba")
+            elif hasattr(actual_classifier, 'decision_function'):
+                predict_fn = lambda x: expit(actual_classifier.decision_function(x))
+                print("  ✓ 使用 decision_function + sigmoid")
+            else:
+                raise ValueError("模型没有predict_proba或decision_function")
+
+            test_pred = predict_fn(background_data.iloc[:5].values)
+            print(f"  🔍 预测测试: {test_pred}")
+            print(f"  🔍 预测范围: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
+
+            explainer = shap.KernelExplainer(predict_fn, background_data)
+            print("  ✓ KernelExplainer 创建完成")
+
+        # ------------------------------------------
+        # 步骤 3: 计算 SHAP 值
+        # ------------------------------------------
+        print("\n[3/9] 计算 SHAP 值...")
+        print("  ⏳ 这可能需要几分钟...")
+
+        explainer_type = type(explainer).__name__
+        print(f"  ℹ️ Explainer类型: {explainer_type}")
+
+        if "Tree" in explainer_type:
+            shap_values = explainer(X_sample, check_additivity=False)
+        elif "Linear" in explainer_type:
+            shap_values = explainer(X_sample)
+        else:
+            print(f"  ℹ️ 检测到 {explainer_type}，使用兼容模式计算...")
+            raw_values = explainer.shap_values(X_sample)
+
+            if isinstance(raw_values, list):
+                vals = raw_values[1]
+                base_val = explainer.expected_value[1]
+            else:
+                vals = raw_values
+                base_val = explainer.expected_value
+
+            shap_values = shap.Explanation(
+                values=vals,
+                base_values=base_val,
+                data=X_sample.values,
+                feature_names=list(feature_names)
+            )
+            print(f"  🔍 SHAP值范围: [{vals.min():.4f}, {vals.max():.4f}]")
+            print(f"  🔍 SHAP值均值: {np.abs(vals).mean():.4f}")
+            print(f"  🔍 非零SHAP值: {(np.abs(vals) > 1e-6).sum()} / {vals.size}")
+
+        # 提取正类 SHAP 值
+        shap_values_pos = shap_values
+        if len(shap_values.values.shape) == 3:
+            print("  ✓ 检测到多维 SHAP 值，正在提取正类...")
+            shap_values_pos = shap.Explanation(
+                values=shap_values.values[:, :, 1],
+                base_values=(shap_values.base_values[:, 1]
+                             if shap_values.base_values.ndim > 1 else shap_values.base_values),
+                data=shap_values.data,
+                feature_names=shap_values.feature_names
+            )
+
+        print(f"  ✓ 最终 SHAP 值矩阵形状: {shap_values_pos.values.shape}")
+
+        if np.abs(shap_values_pos.values).max() < 1e-6:
+            print("  ⚠️⚠️⚠️ 警告：所有SHAP值接近0！模型可能有问题！")
+        else:
+            print("  ✓ SHAP值计算成功！")
+
+        # ------------------------------------------
+        # 步骤 4: 准备出图所需数据
+        # ------------------------------------------
+        pred_probs = classifier.predict_proba(X_sample)[:, 1]
+        high_risk_idx = int(np.argmax(pred_probs))
+        low_risk_idx  = int(np.argmin(pred_probs))
+        high_risk_prob = pred_probs[high_risk_idx]
+        low_risk_prob  = pred_probs[low_risk_idx]
+
+        mean_abs_shap = np.abs(shap_values_pos.values).mean(axis=0)
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'SHAP_Importance': mean_abs_shap
+        }).sort_values('SHAP_Importance', ascending=False)
+
+        print(f"  High-risk sample: idx={high_risk_idx}, prob={high_risk_prob:.4f}")
+        print(f"  Low-risk  sample: idx={low_risk_idx},  prob={low_risk_prob:.4f}")
+
+        # ══════════════════════════════════════════════════════════════
+        # Panel G — Feature Importance（左，显示 y 轴标签）
+        # ══════════════════════════════════════════════════════════════
+        print("\n[Panel G] Feature Importance...")
+
+        set_sci_style()
+        mpl.rcParams.update(SHAP_RC)
+
+        fig_g, ax_g = plt.subplots(figsize=(3.5, 2.75))
+
+        top_n   = 5
+        imp_top = importance_df.head(top_n).iloc[::-1].reset_index(drop=True)
+        vals    = imp_top['SHAP_Importance'].values
+        names   = imp_top['Feature'].values
+        n       = len(vals)
+
+        cmap_shap  = mcm.get_cmap('RdBu_r')
+        norm_vals  = (vals - vals.min()) / (vals.max() - vals.min() + 1e-9)
+        bar_colors = [cmap_shap(0.55 + 0.40 * v) for v in norm_vals]
+
+        spacing = 0.8                     # 条形中心间距，越小间距越窄
+        y_pos = np.arange(n) * spacing
+
+        bars = ax_g.barh(
+            y_pos, vals,
+            color=bar_colors,
+            edgecolor='none',
+            height=0.55,
+        )
+
+        ax_g.set_yticks(y_pos)
+        ax_g.set_yticklabels(names, fontsize=8)
+        ax_g.tick_params(axis='y', left=False)
+        ax_g.set_ylim(-spacing * 0.6, y_pos[-1] + spacing * 0.6)
+
+        # ── x 轴 ──
+        x_max = vals.max()
+        ax_g.set_xlim(0, x_max * 1.30)
+        ax_g.set_xlabel('Mean |SHAP|', fontsize=9, labelpad=4)
+        ax_g.xaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=4, prune='both'))
+        ax_g.tick_params(axis='x', width=0.8, size=3.5, labelsize=7)
+
+        for bar, val in zip(bars, vals):
+            ax_g.text(
+                val + x_max * 0.03,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:.3f}',
+                va='center', ha='left',
+                fontsize=7, color='#444444',
+            )
+
+        ax_g.spines['top'].set_visible(False)
+        ax_g.spines['right'].set_visible(False)
+        ax_g.spines['left'].set_visible(True)
+        ax_g.spines['bottom'].set_linewidth(0.8)
+        ax_g.set_title('')
+
+        plt.tight_layout()
+        plt.savefig('figures/FigG_Feature_Importance.png', dpi=600, bbox_inches='tight')
+        plt.savefig('figures/FigG_Feature_Importance.pdf', bbox_inches='tight')
+        print("  ✓ FigG_Feature_Importance.png / .pdf")
+        plt.close()
+
+        # ══════════════════════════════════════════════════════════════
+        # Panel H — SHAP Beeswarm（右，不显示 y 轴标签）
+        # ══════════════════════════════════════════════════════════════
+        print("\n[Panel H] SHAP Beeswarm...")
+
+        set_sci_style()
+        mpl.rcParams.update(SHAP_RC)
+
+        fig_h, ax_h = plt.subplots(figsize=(4, 3))
+
+        shap.summary_plot(
             shap_values_pos.values,
             X_sample,
             feature_names=feature_names,
-            interaction_index=None,
-            ax=ax,
             show=False,
-            dot_size=8,
-            alpha=0.9
+            max_display=5,
+            plot_size=None,
+            color_bar=True,
+            plot_type='dot',
         )
-        sci_ax(ax, xlabel=feat, ylabel='SHAP value', title=f'{feat}')
+
+        ax_h = plt.gca()
+        ax_h.set_title('')
+
+        # ── y 轴：隐藏标签，保留刻度位置与 G 对齐 ──
+        ax_h.set_yticklabels(['' for _ in ax_h.get_yticklabels()])
+        ax_h.tick_params(axis='y', left=False)
+
+        # ── colorbar 美化 ──
+        if len(fig_h.axes) > 1:
+            cbar_ax = fig_h.axes[-1]
+            cbar_ax.tick_params(labelsize=7, width=0.4, size=3)
+            cbar_ax.set_ylabel('Feature value', fontsize=8, labelpad=3)
+            cbar_ax.spines[:].set_linewidth(0.4)
+
+        ax_h.spines['top'].set_visible(False)
+        ax_h.spines['right'].set_visible(False)
+        ax_h.spines['left'].set_visible(False)
+        ax_h.spines['bottom'].set_linewidth(1.0)
+        ax_h.tick_params(axis='x', width=0.8, size=3.5, labelsize=8)
+        ax_h.set_xlabel('SHAP value', fontsize=9, labelpad=5)
+        ax_h.axvline(0, color='#999999', lw=0.8, ls='--', zorder=0)
 
         plt.tight_layout()
-        safe_name = feat.replace('/', '_').replace(' ', '_').replace('(', '').replace(')', '')
-        save_path = f'figures/SHAP_Dependence/SHAP_Dependence_{safe_name}.png'
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        print(f"  ✓ 已保存: {save_path}")
-        plt.close()
-    except Exception as e:
-        print(f"  ⚠️ 特征 {feat} 依赖图绘制失败: {e}")
+        plt.savefig('figures/FigH_SHAP_Beeswarm.png', dpi=600, bbox_inches='tight')
+        plt.savefig('figures/FigH_SHAP_Beeswarm.pdf', bbox_inches='tight')
+        print("  ✓ FigH_SHAP_Beeswarm.png / .pdf")
         plt.close()
 
-print("  ✓ 所有 Dependence Plots 已保存至 figures/SHAP_Dependence/")
+        # ══════════════════════════════════════════════════════════════
+        # Panel A — SHAP Summary Beeswarm（全特征）
+        # ══════════════════════════════════════════════════════════════
+        print("\n[Panel A] SHAP Summary Beeswarm...")
 
-# ------------------------------------------
-# 步骤 9: SHAP Heatmap
-# ------------------------------------------
-print("\n[9/14] 绘制 SHAP Heatmap...")
+        fig_a, ax_a = plt.subplots(figsize=(5.5, 3))
 
-n_samples_heatmap = min(50, len(X_sample))
-sorted_indices = np.argsort(pred_probs)[::-1][:n_samples_heatmap]
-
-shap_subset = shap.Explanation(
-    values=shap_values_pos.values[sorted_indices],
-    base_values=(shap_values_pos.base_values
-                 if isinstance(shap_values_pos.base_values, (int, float))
-                 else shap_values_pos.base_values[sorted_indices]),
-    data=X_sample.iloc[sorted_indices].values,
-    feature_names=feature_names
-)
-
-shap.plots.heatmap(shap_subset, show=False, max_display=15)
-
-fig = plt.gcf()
-for a in fig.axes:
-    # 统一 tick 字号
-    a.tick_params(labelsize=7)
-    # 统一 xlabel / ylabel 字号
-    if a.get_ylabel():
-        a.yaxis.label.set_text(
-            'SHAP value' if 'SHAP value' in a.get_ylabel() else a.get_ylabel()
+        shap.summary_plot(
+            shap_values_pos.values,
+            X_sample,
+            feature_names=feature_names,
+            show=False,
+            max_display=20,
+            plot_size=None,
+            color_bar=True,
         )
-        a.yaxis.label.set_size(8)
-    if a.get_xlabel():
-        a.xaxis.label.set_size(8)
-    # 统一 title 字号（f(x) 上方的线图标题）
-    if a.get_title():
-        a.title.set_size(8)
 
-plt.savefig('figures/SHAP_Heatmap.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Heatmap.png")
-plt.close()
+        ax_a = plt.gca()
+        sci_ax(ax_a, xlabel='SHAP value', ylabel='')
+        ax_a.set_title('SHAP Summary', fontsize=9, pad=8)
 
-# ------------------------------------------
-# 步骤 10: SHAP Decision Plot
-# ------------------------------------------
-print("\n[10/14] 绘制 SHAP Decision Plot...")
+        if len(fig_a.axes) > 1:
+            cbar_ax = fig_a.axes[-1]
+            cbar_ax.tick_params(labelsize=6)
+            cbar_ax.set_ylabel('Feature value', fontsize=7, labelpad=3)
 
-high_risk_indices = np.argsort(pred_probs)[-3:][::-1]
-mid_risk_indices = np.argsort(np.abs(pred_probs - 0.5))[:3]
-low_risk_indices = np.argsort(pred_probs)[:3]
-selected_indices = np.concatenate([high_risk_indices, mid_risk_indices, low_risk_indices])
+        plt.tight_layout()
+        plt.savefig('figures/Fig3A_SHAP_Summary.png', dpi=DPI, bbox_inches='tight')
+        plt.savefig('figures/Fig3A_SHAP_Summary.pdf', bbox_inches='tight')
+        print("  ✓ Fig3A_SHAP_Summary.png/.pdf")
+        plt.close()
 
-if isinstance(shap_values_pos.base_values, np.ndarray):
-    expected_value = (shap_values_pos.base_values[0]
-                      if len(shap_values_pos.base_values.shape) > 0
-                      else float(shap_values_pos.base_values))
+        # ══════════════════════════════════════════════════════════════
+        # Panel B — Feature Importance（Top 10）
+        # ══════════════════════════════════════════════════════════════
+        print("\n[Panel B] Feature Importance...")
+
+        fig_b, ax_b = plt.subplots(figsize=(5.5, 3))
+
+        top_n = min(10, len(importance_df))
+        imp_plot = importance_df.head(top_n).iloc[::-1]
+
+        bars = ax_b.barh(
+            range(len(imp_plot)),
+            imp_plot['SHAP_Importance'],
+            color=C_BAR,
+            edgecolor='white',
+            linewidth=0.3,
+            height=0.65,
+            alpha=0.85,
+        )
+
+        ax_b.set_yticks(range(len(imp_plot)))
+        ax_b.set_yticklabels(imp_plot['Feature'], fontsize=7)
+        sci_ax(ax_b, xlabel='Mean |SHAP value|')
+        ax_b.set_title('Feature Importance', fontsize=9, pad=8)
+
+        x_max = imp_plot['SHAP_Importance'].max()
+        for i, (bar, val) in enumerate(zip(bars, imp_plot['SHAP_Importance'])):
+            ax_b.text(val + x_max * 0.025, i,
+                      f'{val:.4f}', va='center', fontsize=6.5, color=C_ANNOT)
+
+        plt.tight_layout()
+        plt.savefig('figures/Fig3B_Feature_Importance.png', dpi=DPI, bbox_inches='tight')
+        plt.savefig('figures/Fig3B_Feature_Importance.pdf', bbox_inches='tight')
+        print("  ✓ Fig3B_Feature_Importance.png/.pdf")
+        plt.close()
+
+        # ══════════════════════════════════════════════════════════════
+        # Panel C — Waterfall (High-risk)
+        # ══════════════════════════════════════════════════════════════
+        print(f"\n[Panel C] Waterfall — High-risk (prob={high_risk_prob:.3f})...")
+
+        fig_c = plt.figure(figsize=(5, 3))
+        shap.waterfall_plot(shap_values_pos[high_risk_idx], show=False, max_display=15)
+
+        all_ax_c = fig_c.get_axes()
+        ax_c = all_ax_c[0]
+        ax_c.set_title(
+            f'High-risk sample (Predicted Probability = {high_risk_prob:.3f})',
+            fontsize=10, pad=10
+        )
+        despine(ax_c)
+
+        for a in all_ax_c:
+            a.tick_params(labelsize=10)
+            for txt in a.texts:
+                txt.set_fontsize(10)
+
+        if len(all_ax_c) > 2:
+            for label in all_ax_c[2].get_xticklabels()[1:]:
+                label.set_visible(False)
+
+        plt.tight_layout()
+        plt.savefig('figures/Fig3C_Waterfall_HighRisk.png', dpi=DPI, bbox_inches='tight')
+        plt.savefig('figures/Fig3C_Waterfall_HighRisk.pdf', bbox_inches='tight')
+        print("  ✓ Fig3C_Waterfall_HighRisk.png/.pdf")
+        plt.close()
+
+        # ══════════════════════════════════════════════════════════════
+        # Panel D — Waterfall (Low-risk)
+        # ══════════════════════════════════════════════════════════════
+        print(f"\n[Panel D] Waterfall — Low-risk (prob={low_risk_prob:.3f})...")
+
+        fig_d = plt.figure(figsize=(5, 3))
+        shap.waterfall_plot(shap_values_pos[low_risk_idx], show=False, max_display=15)
+
+        all_ax_d = fig_d.get_axes()
+        ax_d = all_ax_d[0]
+        ax_d.set_title(
+            f'Low-risk sample (Predicted Probability = {low_risk_prob:.3f})',
+            fontsize=10, pad=10
+        )
+        despine(ax_d)
+
+        for a in all_ax_d:
+            a.tick_params(labelsize=10)
+            for txt in a.texts:
+                txt.set_fontsize(10)
+
+        if len(all_ax_d) > 2:
+            for label in all_ax_d[2].get_xticklabels()[1:]:
+                label.set_visible(False)
+
+        plt.tight_layout()
+        plt.savefig('figures/Fig3D_Waterfall_LowRisk.png', dpi=DPI, bbox_inches='tight')
+        plt.savefig('figures/Fig3D_Waterfall_LowRisk.pdf', bbox_inches='tight')
+        print("  ✓ Fig3D_Waterfall_LowRisk.png/.pdf")
+        plt.close()
+
+        # ------------------------------------------
+        # 步骤 8b: 眼轴长 SHAP 依赖图 — Development vs External（并排）
+        # ------------------------------------------
+        print("\n[8b/14] 绘制 Axial-length SHAP Dependence (Development vs External)...")
+
+        RNG_AL = np.random.default_rng(42)
+
+        # ---------- 0. 稳健定位眼轴长特征 ----------
+        def _locate_feature(feature_names, raw_key, keywords=(), display_fallback=None):
+            """
+            在 feature_names 中稳健定位特征，返回 (idx, label)。
+            依次尝试：rename 后的标准标签 → 原始键本身 → 关键词模糊匹配（大小写不敏感）。
+            """
+            fn = [str(f) for f in feature_names]
+
+            # (a) rename 后的展示标签
+            label = display_fallback
+            try:
+                label = rename_feature(raw_key)
+            except Exception:
+                pass
+            if label and label in fn:
+                return fn.index(label), label
+
+            # (b) 原始键本身（万一列表没被重命名）
+            if raw_key in fn:
+                return fn.index(raw_key), raw_key
+
+            # (c) 关键词模糊匹配
+            hits = [i for i, f in enumerate(fn)
+                    if f.strip().lower() == raw_key.lower()
+                    or any(k.lower() in f.lower() for k in keywords)]
+            if len(hits) == 1:
+                return hits[0], fn[hits[0]]
+            if len(hits) > 1:                          # 多个候选时优先含首个关键词者
+                for i in hits:
+                    if keywords and keywords[0].lower() in fn[i].lower():
+                        return i, fn[i]
+                return hits[0], fn[hits[0]]
+
+            raise ValueError(
+                "❌ 无法在 feature_names 中定位眼轴长特征。\n"
+                f"   rename_feature({raw_key!r}) = {label!r}\n"
+                f"   现有特征名 = {fn}\n"
+                "   → 请检查 AL_RAW_KEY 是否与建模时的原始列名一致。"
+            )
+
+        _al_idx, AL_LABEL = _locate_feature(
+            feature_names, AL_RAW_KEY, keywords=('axial',),
+            display_fallback='Axial length (mm)')
+        print(f"  ✓ 眼轴长特征已定位: idx={_al_idx}, label={AL_LABEL!r}")
+
+        # ---------- 1. 计算外部队列 SHAP 值 ----------
+        _expl_type = type(explainer).__name__
+        if "Tree" in _expl_type:
+            _sv_ext = explainer(X_ext_df, check_additivity=False)
+        elif "Linear" in _expl_type:
+            _sv_ext = explainer(X_ext_df)
+        else:
+            _raw_ext = explainer.shap_values(X_ext_df)
+            if isinstance(_raw_ext, list):
+                _v, _b = _raw_ext[1], explainer.expected_value[1]
+            else:
+                _v, _b = _raw_ext, explainer.expected_value
+            _sv_ext = shap.Explanation(values=_v, base_values=_b,
+                                       data=X_ext_df.values,
+                                       feature_names=list(feature_names))
+
+        shap_values_ext = _sv_ext
+        if len(_sv_ext.values.shape) == 3:
+            shap_values_ext = shap.Explanation(
+                values=_sv_ext.values[:, :, 1],
+                base_values=(_sv_ext.base_values[:, 1]
+                             if _sv_ext.base_values.ndim > 1 else _sv_ext.base_values),
+                data=_sv_ext.data,
+                feature_names=_sv_ext.feature_names
+            )
+        print(f"  ✓ 外部 SHAP 矩阵: {shap_values_ext.values.shape}")
+
+        # ---------- 2. 取回 mm 尺度的眼轴长（建模已标准化，需用原始特征表）----------
+        def _raw_al(df_raw, pos=None):
+            """从未标准化的原始特征表中取 AL(mm)；pos 为需要对齐的行位置。"""
+            if df_raw is None:
+                return None
+            d = pd.DataFrame(df_raw).reset_index(drop=True)
+            col = next((c for c in (AL_RAW_KEY, AL_LABEL) if c in d.columns), None)
+            if col is None:
+                col = next((c for c in d.columns
+                            if 'axial' in str(c).lower() or str(c).strip().lower() == 'al'),
+                           None)
+            if col is None:
+                return None
+            v = pd.to_numeric(d[col], errors='coerce').to_numpy(dtype=float)
+            return v if pos is None else v[np.asarray(pos, dtype=int)]
+
+        # 原始（未标准化）特征表 —— 来自 Model_Package 的 X_train / X_external
+        _X_train_raw = X_TRAIN_RAW
+        _X_ext_raw   = X_EXT_RAW
+
+        al_dev = _raw_al(_X_train_raw, pos=X_sample.index.to_numpy())
+        al_ext = _raw_al(_X_ext_raw)
+
+        if al_dev is None or al_ext is None:
+            print("  ⚠️ 未找到原始 AL 列，改用标准化尺度绘图（横轴单位非 mm）")
+            al_dev = X_sample.iloc[:, _al_idx].to_numpy(dtype=float)
+            al_ext = X_ext_df.iloc[:, _al_idx].to_numpy(dtype=float)
+            AL_AXIS_LABEL = 'Axial length (standardised)'
+        else:
+            AL_AXIS_LABEL = 'Axial length (mm)'
+
+        shap_al_dev = np.asarray(shap_values_pos.values[:, _al_idx], dtype=float)
+        shap_al_ext = np.asarray(shap_values_ext.values[:, _al_idx], dtype=float)
+
+        _m_dev = np.isfinite(al_dev) & np.isfinite(shap_al_dev)
+        _m_ext = np.isfinite(al_ext) & np.isfinite(shap_al_ext)
+        al_dev, shap_al_dev = al_dev[_m_dev], shap_al_dev[_m_dev]
+        al_ext, shap_al_ext = al_ext[_m_ext], shap_al_ext[_m_ext]
+        print(f"  ✓ 有效样本: development n={len(al_dev)}, external n={len(al_ext)}")
+
+        # ---------- 3. 平滑、置信带与拐点 ----------
+        def _fit_spline(x, y, s_factor=1.0):
+            """按 x 去重加权后拟合平滑样条。"""
+            xu, inv = np.unique(x, return_inverse=True)
+            cnt = np.bincount(inv).astype(float)
+            yu = np.bincount(inv, weights=y) / cnt
+            if len(xu) < 5:
+                return None
+            k = 3 if len(xu) > 4 else 1
+            s = s_factor * len(xu) * float(np.var(yu))
+            return UnivariateSpline(xu, yu, w=np.sqrt(cnt), k=k, s=max(s, 1e-9))
+
+        def _smooth(x, y, grid, s_factor=1.0):
+            sp = _fit_spline(x, y, s_factor)
+            return np.full_like(grid, np.nan, dtype=float) if sp is None else sp(grid)
+
+        def _boot_band(x, y, grid, n_boot=N_BOOT_AL, s_factor=1.0):
+            curves = np.full((n_boot, len(grid)), np.nan)
+            n = len(x)
+            for b in range(n_boot):
+                ii = RNG_AL.integers(0, n, n)
+                try:
+                    curves[b] = _smooth(x[ii], y[ii], grid, s_factor)
+                except Exception:
+                    pass
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return (np.nanpercentile(curves, 2.5, axis=0),
+                        np.nanpercentile(curves, 97.5, axis=0))
+
+        def _inflection(x, y, grid, s_factor=1.0):
+            """
+            临床阈值 = 平滑 SHAP 曲线从负(保护)翻转为正(风险)的过零点。
+            与独立脚本 "分箱均值 → 首次符号变号 → 线性插值" 方法一致,
+            可让 Dev vs Ext 并排图与临床尺度反推图相互对齐。
+            """
+            sp = _fit_spline(x, y, s_factor)
+            if sp is None:
+                return np.nan
+            smoothed = sp(grid)
+            # 限定核心区,避免边缘外推伪影
+            core = (grid >= np.percentile(x, 5)) & (grid <= np.percentile(x, 95))
+            if core.sum() < 2:
+                return np.nan
+            gc, yc = grid[core], smoothed[core]
+
+            # 首次负→正符号变换
+            sign = np.sign(yc)
+            sign[sign == 0] = 1
+            crossings = np.where(np.diff(sign) > 0)[0]
+
+            if len(crossings) == 0:
+                # 全程未过零 → 用 |SHAP| 最小处兜底
+                return float(gc[int(np.nanargmin(np.abs(yc)))])
+
+            i = crossings[0]
+            x1, x2, y1, y2 = gc[i], gc[i + 1], yc[i], yc[i + 1]
+            if y2 == y1:
+                return float(x1)
+            return float(x1 - y1 * (x2 - x1) / (y2 - y1))
+
+        _g_dev = np.linspace(np.percentile(al_dev, 1), np.percentile(al_dev, 99), 200)
+        _g_ext = np.linspace(np.percentile(al_ext, 1), np.percentile(al_ext, 99), 200)
+
+        curve_dev = _smooth(al_dev, shap_al_dev, _g_dev)
+        curve_ext = _smooth(al_ext, shap_al_ext, _g_ext)
+        lo_dev, hi_dev = _boot_band(al_dev, shap_al_dev, _g_dev)
+        lo_ext, hi_ext = _boot_band(al_ext, shap_al_ext, _g_ext)
+
+        infl_dev = _inflection(al_dev, shap_al_dev, _g_dev)
+        infl_ext = _inflection(al_ext, shap_al_ext, _g_ext)
+        print(f"  ✓ Model-derived inflection: development={infl_dev:.2f}, external={infl_ext:.2f}")
+
+        # ---------- 4. 绘图（沿用主图风格：set_sci_style + SHAP_RC）----------
+        set_sci_style()
+        mpl.rcParams.update(SHAP_RC)
+
+        fig_al, axes_al = plt.subplots(1, 2, figsize=(6.7, 2.9), sharey=True)
+
+        _panels = [
+            (axes_al[0], al_dev, shap_al_dev, _g_dev, curve_dev, lo_dev, hi_dev,
+             infl_dev, COLOR_INTERNAL, 'Development cohort', ''),
+            (axes_al[1], al_ext, shap_al_ext, _g_ext, curve_ext, lo_ext, hi_ext,
+             infl_ext, COLOR_EXTERNAL, 'External validation cohort', ''),
+        ]
+
+        _all_shap = np.concatenate([shap_al_dev, shap_al_ext])
+        _pad = 0.16 * (np.nanmax(_all_shap) - np.nanmin(_all_shap) + 1e-9)
+        _ylim = (np.nanmin(_all_shap) - _pad, np.nanmax(_all_shap) + _pad)
+
+        for ax, xv, yv, grid, curve, lo, hi, infl, col, ttl, tag in _panels:
+            ax.axhline(0, color='#999999', lw=0.8, ls='--', zorder=0)
+
+            ax.scatter(xv, yv, s=7, alpha=0.40, color=col,
+                       edgecolors='none', zorder=1, rasterized=True)
+            ax.fill_between(grid, lo, hi, color=col, alpha=0.16, lw=0, zorder=2)
+            ax.plot(grid, curve, color=col, lw=1.6, zorder=3)
+
+            # 建模队列拐点在外部面板作浅灰参考线
+            if tag == 'b' and np.isfinite(infl_dev):
+                ax.axvline(infl_dev, color='#BBBBBB', lw=0.9, ls='-', zorder=1)
+
+            if np.isfinite(infl):
+                ax.axvline(infl, color='#444444', lw=1.0, ls=':', zorder=4)
+                ax.annotate(f'SHAP threshold\n(neg → pos), {infl:.1f} mm',
+                            xy=(infl, _ylim[1]), xytext=(4, -2),
+                            textcoords='offset points',
+                            ha='left', va='top', fontsize=7, color='#444444')
+
+            # 底部 rug — 展示数据密度
+            _rug_y = _ylim[0] + 0.02 * (_ylim[1] - _ylim[0])
+            ax.plot(xv, np.full_like(xv, _rug_y), '|', color=col,
+                    alpha=0.35, ms=3, mew=0.5, zorder=1)
+
+            ax.set_ylim(*_ylim)
+            ax.set_xlabel(AL_AXIS_LABEL, fontsize=9, labelpad=4)
+            ax.set_title(f'{ttl} (n = {len(xv)})', fontsize=9, pad=6)
+            ax.xaxis.set_major_locator(mpl.ticker.MaxNLocator(nbins=5))
+            ax.tick_params(axis='both', width=0.8, size=3.5, labelsize=7)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.text(-0.02, 1.10, tag, transform=ax.transAxes,
+                    fontsize=11, fontweight='bold', va='top', ha='right')
+
+        axes_al[0].set_ylabel('SHAP value for axial length\n(log-odds)',
+                              fontsize=9, labelpad=4)
+
+        # 图例：development 拐点参考线
+        if np.isfinite(infl_dev):
+            _ref = Line2D([0], [0], color='#BBBBBB', lw=0.9,
+                          label=f'Development threshold ({infl_dev:.1f} mm)')
+            sci_legend(axes_al[1], handles=[_ref], loc='lower right', fontsize=7)
+
+        plt.tight_layout()
+        plt.savefig('figures/FigAL_Dependence_Dev_vs_Ext.png', dpi=DPI, bbox_inches='tight')
+        plt.savefig('figures/FigAL_Dependence_Dev_vs_Ext.pdf', bbox_inches='tight')
+        print("  ✓ FigAL_Dependence_Dev_vs_Ext.png / .pdf")
+        plt.close()
+
+        # ---------- 5. 导出曲线数据（供审稿/复核）----------
+        pd.concat([
+            pd.DataFrame({'Cohort': 'Development', 'Axial_length': _g_dev,
+                          'SHAP_smooth': curve_dev, 'CI_low': lo_dev, 'CI_high': hi_dev,
+                          'SHAP_threshold_mm': infl_dev}),
+            pd.DataFrame({'Cohort': 'External', 'Axial_length': _g_ext,
+                          'SHAP_smooth': curve_ext, 'CI_low': lo_ext, 'CI_high': hi_ext,
+                          'SHAP_threshold_mm': infl_ext}),
+        ]).to_csv(f'{DATA_PATH}/AL_SHAP_Dependence_Curves_{TIMESTAMP}.csv', index=False)
+        print(f"  ✓ 曲线数据已导出: {DATA_PATH}/AL_SHAP_Dependence_Curves_{TIMESTAMP}.csv")
+
+    finally:
+        # 恢复全局绘图样式，避免影响后续图形
+        mpl.rcParams.update(_saved_rcParams)
+
+
+if HAS_SHAP:
+    try:
+        run_shap_module()
+    except FileNotFoundError as e:
+        print(f"⚠️ 跳过 SHAP 模块（缺少文件）: {e}")
+    except KeyError as e:
+        print(f"⚠️ 跳过 SHAP 模块（数据包缺少字段 {e}）")
 else:
-    expected_value = shap_values_pos.base_values
+    print("⚠️ 未安装 shap，已跳过 SHAP 模块。")
 
-shap.decision_plot(
-    expected_value,
-    shap_values_pos.values[selected_indices],
-    X_sample.iloc[selected_indices],
-    feature_names=feature_names,
-    feature_order='importance',
-    show=False,
-    highlight=[0, 1, 2]
-)
 
-fig = plt.gcf()
-for a in fig.axes:
-    a.tick_params(labelsize=7)
-    if a.get_ylabel():
-        a.yaxis.label.set_size(8)
-    if a.get_xlabel():
-        a.xaxis.label.set_size(8)
-    if a.get_title():
-        a.title.set_size(9)
+# ==========================================================================================
+# 九、补充图 S1–S4（移植自 comprehensive_analysis.py 的 section1–section4 绘图部分）
+# ==========================================================================================
 
-plt.savefig('figures/SHAP_Decision_Plot.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Decision_Plot.png")
-plt.close()
+print("\n" + "=" * 60)
+print("📎 生成补充图 S1–S4 ...")
+print("=" * 60)
 
-# ------------------------------------------
-# 步骤 11: SHAP 值分布箱线图
-# ------------------------------------------
-print("\n[11/14] 绘制 SHAP 值分布箱线图...")
+# ---------------- 可调参数 ----------------
+SUPP_ENABLE       = True          # 一键开关
+SUPP_DIR          = 'figures'     # 输出目录（与正文图同级）
+SUPP_N_BOOT_CAL   = 500           # 校准带 bootstrap 次数（正文面板 E 用 1000）
+SUPP_N_BOOT_DCA   = 300           # DCA 置信带 bootstrap 次数
+SUPP_DCA_XMAX     = 0.5           # DCA 横轴上限（与正文 F 一致）
+SUPP_MODELS       = ['Plain_LR', 'XGBoost']     # S1–S3 并列比较的两个模型
+SUPP_S4_MODELS    = ['XGB_5var_LASSO', 'XGB_10var_Full']
 
-fig, ax = plt.subplots(figsize=(5, 4))
+_SUPP_STATS_ROWS = []             # 汇总各图统计量，最后统一导出 CSV
 
-top10_features = importance_df['Feature'].head(10).tolist()
-top10_indices = [list(feature_names).index(f) for f in top10_features]
-top10_shap_values = [shap_values_pos.values[:, i] for i in top10_indices]
 
-bp = ax.boxplot(
-    top10_shap_values,
-    labels=top10_features,
-    vert=False,
-    patch_artist=True,
-    showmeans=True,
-    widths=0.55,
-    meanprops=dict(marker='D', markerfacecolor=C_RED, markeredgecolor='white',
-                   markersize=4, markeredgewidth=0.5),
-    medianprops=dict(color='white', linewidth=1),
-    whiskerprops=dict(linewidth=0.6),
-    capprops=dict(linewidth=0.6),
-    flierprops=dict(marker='o', markersize=2, alpha=0.4,
-                    markerfacecolor=C_GRAY, markeredgecolor='none')
-)
-
-for patch in bp['boxes']:
-    patch.set_facecolor(C_BLUE)
-    patch.set_alpha(0.6)
-    patch.set_edgecolor('white')
-    patch.set_linewidth(0.5)
-
-ax.axvline(0, color='black', linestyle='-', linewidth=0.5, alpha=0.4)
-sci_ax(ax, xlabel='SHAP value', title='SHAP Value Distribution')
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Value_Distribution.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Value_Distribution.png")
-plt.close()
-
-# ------------------------------------------
-# 步骤 12: SHAP 正负影响统计分析
-# ------------------------------------------
-print("\n[12/14] 绘制 SHAP 正负影响分析...")
-
-positive_impact_pct, negative_impact_pct = [], []
-mean_positive_shap, mean_negative_shap = [], []
-
-for i, feat in enumerate(feature_names):
-    shap_vals = shap_values_pos.values[:, i]
-    pos_mask = shap_vals > 0
-    neg_mask = shap_vals < 0
-
-    positive_impact_pct.append((pos_mask.sum() / len(shap_vals)) * 100)
-    negative_impact_pct.append((neg_mask.sum() / len(shap_vals)) * 100)
-    mean_positive_shap.append(shap_vals[pos_mask].mean() if pos_mask.any() else 0)
-    mean_negative_shap.append(shap_vals[neg_mask].mean() if neg_mask.any() else 0)
-
-impact_df = pd.DataFrame({
-    'Feature': feature_names,
-    'Positive_%': positive_impact_pct,
-    'Negative_%': negative_impact_pct,
-    'Mean_Positive_SHAP': mean_positive_shap,
-    'Mean_Negative_SHAP': mean_negative_shap
-})
-
-top15_impact = (impact_df.merge(importance_df, on='Feature')
-                .sort_values('SHAP_Importance', ascending=False)
-                .head(15).iloc[::-1])
-
-fig, axes = plt.subplots(1, 2, figsize=(9, 4.5))
-
-y_pos = range(len(top15_impact))
-
-# 左图：正负影响比例
-axes[0].barh(y_pos, top15_impact['Positive_%'],
-             color=C_POS, alpha=0.75, height=0.6, label='Positive')
-axes[0].barh(y_pos, -top15_impact['Negative_%'],
-             color=C_NEG, alpha=0.75, height=0.6, label='Negative')
-axes[0].set_yticks(y_pos)
-axes[0].set_yticklabels(top15_impact['Feature'], fontsize=6.5)
-axes[0].axvline(0, color='black', linewidth=0.5)
-sci_ax(axes[0], xlabel='Samples (%)', title='Impact direction')
-axes[0].legend(fontsize=6, loc='lower right')
-
-# 右图：平均SHAP值
-axes[1].barh(y_pos, top15_impact['Mean_Positive_SHAP'],
-             color=C_POS, alpha=0.75, height=0.6, label='Mean positive')
-axes[1].barh(y_pos, top15_impact['Mean_Negative_SHAP'],
-             color=C_NEG, alpha=0.75, height=0.6, label='Mean negative')
-axes[1].set_yticks(y_pos)
-axes[1].set_yticklabels([])   # 共享标签，右图不重复
-axes[1].axvline(0, color='black', linewidth=0.5)
-sci_ax(axes[1], xlabel='Mean SHAP value', title='Average SHAP by direction')
-axes[1].legend(fontsize=6, loc='lower right')
-
-plt.tight_layout(w_pad=1.5)
-plt.savefig('figures/SHAP_Positive_Negative_Impact.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Positive_Negative_Impact.png")
-plt.close()
-
-impact_df.to_csv('figures/SHAP_Impact_Statistics.csv', index=False)
-print("  ✓ 已保存: figures/SHAP_Impact_Statistics.csv")
-
-# ------------------------------------------
-# 步骤 13: SHAP 累积贡献图
-# ------------------------------------------
-print("\n[13/14] 绘制 SHAP 累积贡献图...")
-
-sorted_importance = importance_df.sort_values('SHAP_Importance', ascending=False)
-cumulative_importance = (np.cumsum(sorted_importance['SHAP_Importance'])
-                         / sorted_importance['SHAP_Importance'].sum() * 100)
-
-fig, ax = plt.subplots(figsize=(4, 3.2))
-
-# 填充 + 曲线
-ax.fill_between(range(1, len(cumulative_importance) + 1), cumulative_importance,
-                alpha=0.12, color=C_BLUE)
-ax.plot(range(1, len(cumulative_importance) + 1), cumulative_importance,
-        color=C_BLUE, linewidth=1.5, zorder=3)
-
-# 阈值线
-ax.axhline(80, color=C_POS, linestyle='--', linewidth=0.6, alpha=0.7)
-ax.axhline(90, color=C_ORANGE, linestyle='--', linewidth=0.6, alpha=0.7)
-
-# 关键点
-n_80 = int(np.argmax(cumulative_importance >= 80)) + 1
-n_90 = int(np.argmax(cumulative_importance >= 90)) + 1
-ax.scatter([n_80], [80], s=30, c=C_POS, zorder=5,
-           edgecolors='white', linewidths=0.6)
-ax.scatter([n_90], [90], s=30, c=C_ORANGE, zorder=5,
-           edgecolors='white', linewidths=0.6)
-
-# 标注
-offset_x = max(1.5, len(cumulative_importance) * 0.08)
-ax.annotate(f'n = {n_80} (80 %)', xy=(n_80, 80),
-            xytext=(n_80 + offset_x, 72),
-            fontsize=6.5, color=C_POS,
-            arrowprops=dict(arrowstyle='->', color=C_POS, lw=0.8))
-ax.annotate(f'n = {n_90} (90 %)', xy=(n_90, 90),
-            xytext=(n_90 + offset_x, 95),
-            fontsize=6.5, color=C_ORANGE,
-            arrowprops=dict(arrowstyle='->', color=C_ORANGE, lw=0.8))
-
-sci_ax(ax, xlabel='Number of features',
-       ylabel='Cumulative importance (%)',
-       title='Cumulative Feature Importance')
-ax.set_ylim(0, 105)
-ax.set_xlim(0, len(cumulative_importance) + 1)
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Cumulative_Importance.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Cumulative_Importance.png")
-print(f"  ℹ️ {n_80} 个特征贡献了 80% 的预测能力")
-print(f"  ℹ️ {n_90} 个特征贡献了 90% 的预测能力")
-plt.close()
-
-# ------------------------------------------
-# 步骤 14: SHAP 与原始特征相关性分析
-# ------------------------------------------
-print("\n[14/14] 绘制 SHAP 与原始特征相关性分析...")
-
-from scipy.stats import pearsonr
-
-correlations, p_values = [], []
-for i, feat in enumerate(feature_names):
-    feat_values = X_sample.iloc[:, i].values
-    shap_vals = shap_values_pos.values[:, i]
-    mask = ~(np.isnan(feat_values) | np.isnan(shap_vals))
-    if mask.sum() > 10:
-        corr, p = pearsonr(feat_values[mask], shap_vals[mask])
-        correlations.append(corr)
-        p_values.append(p)
-    else:
-        correlations.append(np.nan)
-        p_values.append(np.nan)
-
-corr_df = pd.DataFrame({
-    'Feature': feature_names,
-    'Correlation': correlations,
-    'P_Value': p_values,
-    'Abs_Correlation': np.abs(correlations)
-}).sort_values('Abs_Correlation', ascending=False)
-
-top20_corr = corr_df.head(20).iloc[::-1]
-
-fig, ax = plt.subplots(figsize=(4.5, 5))
-colors_corr = [C_NEG if c < 0 else C_POS for c in top20_corr['Correlation']]
-bars = ax.barh(range(len(top20_corr)), top20_corr['Correlation'],
-               color=colors_corr, alpha=0.7, height=0.6)
-
-ax.set_yticks(range(len(top20_corr)))
-ax.set_yticklabels(top20_corr['Feature'], fontsize=6.5)
-ax.axvline(0, color='black', linewidth=0.5)
-sci_ax(ax, xlabel='Pearson r (feature value ↔ SHAP value)',
-       title='SHAP–Feature Correlation')
-
-# 标注
-for i, (bar, (_, row)) in enumerate(zip(bars, top20_corr.iterrows())):
-    corr_val = row['Correlation']
-    p_val = row['P_Value']
-    sig = '***' if p_val < 0.001 else ('**' if p_val < 0.01 else ('*' if p_val < 0.05 else ''))
-    label = f'{corr_val:.2f}{sig}'
-    x_pos = corr_val + (0.02 if corr_val > 0 else -0.02)
-    ha = 'left' if corr_val > 0 else 'right'
-    ax.text(x_pos, i, label, va='center', ha=ha, fontsize=5.5, color=C_GRAY)
-
-plt.tight_layout()
-plt.savefig('figures/SHAP_Feature_Correlation.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/SHAP_Feature_Correlation.png")
-plt.close()
-
-corr_df.to_csv('figures/SHAP_Feature_Correlation.csv', index=False)
-print("  ✓ 已保存: figures/SHAP_Feature_Correlation.csv")
-
-# ------------------------------------------
-# 步骤 15: SHAP Force Plot (HTML)
-# ------------------------------------------
-print("\n[额外] 生成 SHAP Force Plot (HTML)...")
-
-try:
-    shap.initjs()
-
-    if hasattr(shap_values_pos, 'base_values'):
-        base_value = shap_values_pos.base_values[high_risk_idx]
-    elif isinstance(explainer.expected_value, np.ndarray):
-        base_value = explainer.expected_value[1]
-    else:
-        base_value = explainer.expected_value
-
-    force_plot = shap.force_plot(
-        base_value,
-        shap_values_pos.values[high_risk_idx],
-        X_sample.iloc[high_risk_idx],
-        show=False
-    )
-    shap.save_html('figures/SHAP_Force_Plot_HighRisk.html', force_plot)
-    print("  ✓ 已保存: figures/SHAP_Force_Plot_HighRisk.html")
-
-    force_plot_all = shap.force_plot(
-        base_value if isinstance(base_value, (int, float)) else shap_values_pos.base_values[:100],
-        shap_values_pos.values[:100],
-        X_sample.iloc[:100],
-        show=False
-    )
-    shap.save_html('figures/SHAP_Force_Plot_All.html', force_plot_all)
-    print("  ✓ 已保存: figures/SHAP_Force_Plot_All.html")
-
-except Exception as e:
-    print(f"  ⚠️ Force Plot 生成失败: {e}")
-
-try:
-    shap.force_plot(
-        shap_values_pos.base_values[high_risk_idx],
-        shap_values_pos.values[high_risk_idx],
-        X_sample.iloc[high_risk_idx],
-        feature_names=feature_names,
-        matplotlib=True,
-        show=False
-    )
-
-    fig = plt.gcf()
-    import re
-    for text_obj in fig.findobj(mpl.text.Text):
-        text_obj.set_fontsize(10)
-        # 将长小数截断为2位
-        s = text_obj.get_text()
-        s = re.sub(r'(\d+\.\d{2})\d+', r'\1', s)
-        text_obj.set_text(s)
-
-    plt.savefig('figures/SHAP_Force_Plot_HighRisk.png', dpi=DPI, bbox_inches='tight')
-    print("  ✓ 已保存: figures/SHAP_Force_Plot_HighRisk.png")
-    plt.close()
-
-except Exception as e:
-    print(f"  ⚠️ Force Plot 生成失败: {e}")
-
-# ------------------------------------------
-# 步骤 16: 综合摘要报告
-# ------------------------------------------
-print(f"\n{'='*60}")
-print("📊 SHAP 分析摘要报告")
-print(f"{'='*60}")
-
-print(f"\n【数据信息】")
-print(f"  - 分析样本数: {len(X_sample)}")
-print(f"  - 特征数量: {len(feature_names)}")
-print(f"  - 模型类型: {type(classifier).__name__}")
-print(f"  - 解释器类型: {type(explainer).__name__}")
-
-print(f"\n【特征重要性】")
-print(f"  - {n_80} 个特征贡献了 80% 的预测能力")
-print(f"  - {n_90} 个特征贡献了 90% 的预测能力")
-
-print(f"\n【Top 10 最重要特征】")
-for idx, row in importance_df.head(10).iterrows():
-    pos_pct = impact_df[impact_df['Feature'] == row['Feature']]['Positive_%'].values[0]
-    print(f"  {idx+1:2d}. {row['Feature']:35s} | SHAP: {row['SHAP_Importance']:.6f} | Positive: {pos_pct:.1f}%")
-
-print(f"\n【高风险样本分析】")
-print(f"  - 样本索引: {high_risk_idx}")
-print(f"  - 预测概率: {high_risk_prob:.4f}")
-print(f"  - Top 3 驱动因素:")
-sample_shap = pd.DataFrame({
-    'Feature': feature_names,
-    'SHAP_Value': shap_values_pos.values[high_risk_idx]
-}).sort_values('SHAP_Value', ascending=False)
-for i, row in sample_shap.head(3).iterrows():
-    print(f"    {row['Feature']:30s} SHAP = {row['SHAP_Value']:+.4f}")
-
-print(f"\n【低风险样本分析】")
-print(f"  - 样本索引: {low_risk_idx}")
-print(f"  - 预测概率: {low_risk_prob:.4f}")
-print(f"  - Top 3 保护因素:")
-sample_shap_low = pd.DataFrame({
-    'Feature': feature_names,
-    'SHAP_Value': shap_values_pos.values[low_risk_idx]
-}).sort_values('SHAP_Value', ascending=True)
-for i, row in sample_shap_low.head(3).iterrows():
-    print(f"    {row['Feature']:30s} SHAP = {row['SHAP_Value']:+.4f}")
-
-print(f"\n【特征相关性发现】")
-top_pos_corr = corr_df[corr_df['Correlation'] > 0].head(3)
-top_neg_corr = corr_df[corr_df['Correlation'] < 0].head(3)
-print(f"  正相关 Top 3:")
-for _, row in top_pos_corr.iterrows():
-    print(f"    {row['Feature']:30s} r = {row['Correlation']:+.3f} (p = {row['P_Value']:.4f})")
-print(f"  负相关 Top 3:")
-for _, row in top_neg_corr.iterrows():
-    print(f"    {row['Feature']:30s} r = {row['Correlation']:+.3f} (p = {row['P_Value']:.4f})")
-
-print(f"\n【输出文件】")
-output_files = [
-    "SHAP_Summary_Beeswarm.png",
-    "SHAP_Importance_Bar.png",
-    "SHAP_Bar_Official.png",
-    "SHAP_Waterfall_HighRisk.png",
-    "SHAP_Waterfall_LowRisk.png",
-    "SHAP_Dependence/SHAP_Dependence_*.png",
-    "SHAP_Heatmap.png",
-    "SHAP_Decision_Plot.png",
-    "SHAP_Value_Distribution.png",
-    "SHAP_Positive_Negative_Impact.png",
-    "SHAP_Cumulative_Importance.png",
-    "SHAP_Feature_Correlation.png",
-    "SHAP_Importance.csv",
-    "SHAP_Impact_Statistics.csv",
-    "SHAP_Feature_Correlation.csv",
-    "SHAP_Force_Plot_*.html"
-]
-for file in output_files:
-    print(f"  ✓ {file}")
-
-print(f"\n{'='*60}")
-print("✅ SHAP 分析完成！")
-print(f"{'='*60}\n")
-
-# ------------------------------------------
-# 保存完整分析结果
-# ------------------------------------------
-shap_results = {
-    'shap_values': shap_values_pos,
-    'importance_df': importance_df,
-    'impact_df': impact_df,
-    'corr_df': corr_df,
-    'X_sample': X_sample,
-    'feature_names': feature_names,
-    'high_risk_idx': high_risk_idx,
-    'low_risk_idx': low_risk_idx,
-    'pred_probs': pred_probs,
-    'n_80_threshold': n_80,
-    'n_90_threshold': n_90
+# ---------------- 模型展示名（沿用 LABEL_MAP 的英文风格）----------------
+MODEL_LABEL_MAP = {
+    'Plain_LR':        'Logistic regression',
+    'XGBoost':         'XGBoost',
+    'XGB_5var_LASSO':  'XGBoost (5 variables)',
+    'XGB_10var_Full':  'XGBoost (10 variables)',
+    'LR_Ridge':        'Ridge logistic regression',
+    'LR_ElasticNet':   'Elastic-net logistic regression',
+    'RandomForest':    'Random forest',
+    'LightGBM':        'LightGBM',
+    'Stacking':        'Stacking ensemble',
 }
 
-joblib.dump(shap_results, 'figures/SHAP_Analysis_Results.pkl')
-print("💾 SHAP 分析结果已保存至: figures/SHAP_Analysis_Results.pkl\n")
 
-# ============================================================================
-# 恢复主样式 (SHAP 专用样式仅在 SHAP 区段内生效)
-# ============================================================================
-mpl.rcParams.update(_saved_rcParams)
-set_sci_style()  # 重新应用主 SCI 样式
-
-
-# ------------------------------------------
-# 1. Bootstrap AUC 分布图（外部验证稳定性）
-# ------------------------------------------
-print("\n[额外-1] 绘制 Bootstrap AUC 分布图...")
-
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-# 1.1 直方图 + 核密度估计
-axes[0].hist(df_bootstrap_raw['AUC'], bins=50, alpha=0.7, 
-             color=COLOR_EXTERNAL, edgecolor='none', density=True)
-
-# 添加核密度估计曲线
-from scipy.stats import gaussian_kde
-kde = gaussian_kde(df_bootstrap_raw['AUC'])
-x_range = np.linspace(df_bootstrap_raw['AUC'].min(), 
-                      df_bootstrap_raw['AUC'].max(), 100)
-axes[0].plot(x_range, kde(x_range), 'r-', linewidth=2, label='KDE')
-
-# 添加均值和置信区间
-mean_auc = df_bootstrap_summary.loc['AUC', 'Mean']
-ci_lower = df_bootstrap_summary.loc['AUC', '95%_CI_Lower']
-ci_upper = df_bootstrap_summary.loc['AUC', '95%_CI_Upper']
-
-axes[0].axvline(mean_auc, color='red', linestyle='--', linewidth=2, 
-                label=f'Mean: {mean_auc:.4f}')
-axes[0].axvline(ci_lower, color='orange', linestyle=':', linewidth=2, 
-                label=f'95% CI: [{ci_lower:.4f}, {ci_upper:.4f}]')
-axes[0].axvline(ci_upper, color='orange', linestyle=':', linewidth=2)
-
-axes[0].set_xlabel('AUC')
-axes[0].set_ylabel('Density')
-axes[0].set_title('Bootstrap AUC distribution', 
-                  fontsize=13)
-axes[0].legend(loc='upper left')
-axes[0].grid(alpha=0.3)
-
-# 1.2 箱线图 + 小提琴图
-parts = axes[1].violinplot([df_bootstrap_raw['AUC']], 
-                           positions=[0], widths=0.7, 
-                           showmeans=True, showmedians=True)
-for pc in parts['bodies']:
-    pc.set_facecolor(COLOR_EXTERNAL)
-    pc.set_alpha(0.7)
-
-# 叠加箱线图
-bp = axes[1].boxplot([df_bootstrap_raw['AUC']], positions=[0], 
-                     widths=0.3, patch_artist=True,
-                     boxprops=dict(facecolor='white', alpha=0.8),
-                     medianprops=dict(color='#E64B35', linewidth=1.5))
-
-axes[1].set_ylabel('AUC')
-axes[1].set_title('Bootstrap AUC variability')
-axes[1].set_xticks([0])
-axes[1].set_xticklabels([f'n={len(df_bootstrap_raw)}'])
-axes[1].grid(axis='y', alpha=0.3)
-
-stats_text = f"Mean: {mean_auc:.4f}\nMedian: {df_bootstrap_summary.loc['AUC', 'Median']:.4f}\nStd: {df_bootstrap_summary.loc['AUC', 'Std']:.4f}"
-axes[1].text(0.95, 0.95, stats_text, transform=axes[1].transAxes,
-            fontsize=10, verticalalignment='top', horizontalalignment='right',
-            bbox=dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor='grey', alpha=0.85, linewidth=1.2))
-
-plt.tight_layout()
-plt.savefig('figures/Bootstrap_AUC_Distribution.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/Bootstrap_AUC_Distribution.png")
-plt.close()
-
-
-# ==============================================================
-# 3. 内部验证 Bootstrap 重采样 + Harrell Optimism Correction
-# ==============================================================
-print("\n" + "="*70)
-print("  内部验证 Bootstrap 重采样 & Harrell Optimism Correction")
-print("="*70)
-import time
-from sklearn.base import clone
-from sklearn.metrics import (roc_auc_score, roc_curve, brier_score_loss,
-                             precision_recall_curve, average_precision_score)
-from sklearn.calibration import calibration_curve
-from scipy import interpolate
-
-# ------------------------------------------
-# 颜色映射（基于 COLORS_LIST）
-# ------------------------------------------
-C_INT      = COLORS_LIST[3]   # #3C5488 深蓝 — 内部验证
-C_EXT      = COLORS_LIST[0]   # #E64B35 红色 — 外部验证
-C_CORRECT  = COLORS_LIST[2]   # #00A087 绿色 — Optimism-Corrected
-C_OOF_LINE = COLORS_LIST[1]   # #4DBBD5 青色 — OOF 原始曲线
-C_EXT_LINE = COLORS_LIST[7]   # #DC0000 深红 — 外部原始曲线
-C_APPARENT = COLORS_LIST[5]   # #8491B4 灰蓝 — Apparent
-C_BRIER    = COLORS_LIST[4]   # #F39B7F 珊瑚橙 — Brier / 第三指标
-
-# ------------------------------------------
-# 3.1 准备数据
-# ------------------------------------------
-print("\n[Step 1] 准备开发集数据...")
-
-if hasattr(best_model, 'named_steps') or hasattr(best_model, 'steps'):
-    X_dev = X_train.copy()
-    model_is_pipeline = True
-    print("  ✓ 检测到 Pipeline 模型，使用原始特征")
-else:
-    X_dev = preprocessor.transform(X_train)
-    model_is_pipeline = False
-    print("  ✓ 检测到独立分类器，已完成特征预处理")
-
-y_dev = y_train.copy()
-print(f"  ✓ 开发集规模: {X_dev.shape[0]} 样本, "
-      f"{X_dev.shape[1] if hasattr(X_dev, 'shape') and len(X_dev.shape) > 1 else 'N/A'} 特征")
-print(f"  ✓ 正例比例: {y_dev.mean():.4f} ({y_dev.sum()}/{len(y_dev)})")
-
-# ------------------------------------------
-# 3.2 Apparent Performance
-# ------------------------------------------
-print("\n[Step 2] 计算 Apparent Performance...")
-
-prob_apparent = best_model.predict_proba(X_dev)[:, 1]
-apparent_auc = roc_auc_score(y_dev, prob_apparent)
-apparent_brier = brier_score_loss(y_dev, prob_apparent)
-apparent_ap = average_precision_score(y_dev, prob_apparent)
-
-print(f"  ✓ Apparent AUC:   {apparent_auc:.4f}")
-print(f"  ✓ Apparent AP:    {apparent_ap:.4f}")
-print(f"  ✓ Apparent Brier: {apparent_brier:.4f}")
-
-# ------------------------------------------
-# 3.3 OOF Performance（5-fold CV × 20 repeats）
-# ------------------------------------------
-print("\n[Step 3] 计算 OOF Performance...")
-
-oof_auc = roc_auc_score(y_int, prob_int)
-oof_brier = brier_score_loss(y_int, prob_int)
-oof_ap = average_precision_score(y_int, prob_int)
-
-print(f"  ✓ OOF AUC:   {oof_auc:.4f}")
-print(f"  ✓ OOF AP:    {oof_ap:.4f}")
-print(f"  ✓ OOF Brier: {oof_brier:.4f}")
-
-# ------------------------------------------
-# 3.4 Harrell Bootstrap Optimism Correction (1000 iterations)
-#     同时收集 ROC + PR 曲线数据
-# ------------------------------------------
-print("\n[Step 4] Harrell Bootstrap Optimism Correction (1000 次)...")
-print("  ⏳ 每次迭代需要 clone + fit，请耐心等待...")
-
-N_BOOT_INTERNAL = 1000
-np.random.seed(42)
-
-mean_fpr = np.linspace(0, 1, 100)
-mean_recall = np.linspace(0, 1, 100)
-
-# ---- 收集容器 ----
-optimism_auc_list = []
-optimism_brier_list = []
-optimism_ap_list = []
-auc_boot_list = []
-auc_orig_list = []
-
-boot_tprs_int = []     # ROC（bootstrap 模型 → 原始数据）
-boot_precs_int = []    # PR （bootstrap 模型 → 原始数据）
-boot_tprs_oof = []     # OOF bootstrap 重采样 ROC
-boot_precs_oof = []    # OOF bootstrap 重采样 PR
-boot_auc_oof = []
-boot_ap_oof = []
-
-start_time = time.time()
-success_count = 0
-fail_count = 0
-
-for i in range(N_BOOT_INTERNAL):
-    if (i + 1) % 100 == 0:
-        elapsed = time.time() - start_time
-        eta = elapsed / (i + 1) * (N_BOOT_INTERNAL - i - 1)
-        print(f"    进度: {i+1}/{N_BOOT_INTERNAL} | "
-              f"已用时: {elapsed:.0f}s | 预计剩余: {eta:.0f}s")
-
-    try:
-        # ========== Part A: Harrell Optimism ==========
-        idx_boot = np.random.choice(len(y_dev), size=len(y_dev), replace=True)
-
-        if hasattr(X_dev, 'iloc'):
-            X_boot = X_dev.iloc[idx_boot].reset_index(drop=True)
-        else:
-            X_boot = X_dev[idx_boot]
-        y_boot = y_dev[idx_boot]
-
-        if len(np.unique(y_boot)) < 2:
-            fail_count += 1
-            continue
-
-        model_boot = clone(best_model)
-        model_boot.fit(X_boot, y_boot)
-
-        # 在 bootstrap 样本上预测
-        prob_on_boot = model_boot.predict_proba(X_boot)[:, 1]
-        auc_boot = roc_auc_score(y_boot, prob_on_boot)
-        brier_boot = brier_score_loss(y_boot, prob_on_boot)
-        ap_boot = average_precision_score(y_boot, prob_on_boot)
-
-        # 在原始开发集上预测
-        prob_on_orig = model_boot.predict_proba(X_dev)[:, 1]
-        auc_orig = roc_auc_score(y_dev, prob_on_orig)
-        brier_orig = brier_score_loss(y_dev, prob_on_orig)
-        ap_orig = average_precision_score(y_dev, prob_on_orig)
-
-        # Optimism
-        optimism_auc_list.append(auc_boot - auc_orig)
-        optimism_brier_list.append(brier_boot - brier_orig)
-        optimism_ap_list.append(ap_boot - ap_orig)
-        auc_boot_list.append(auc_boot)
-        auc_orig_list.append(auc_orig)
-
-        # ROC（bootstrap 模型 → 原始数据）
-        fpr_i, tpr_i, _ = roc_curve(y_dev, prob_on_orig)
-        interp_tpr = np.interp(mean_fpr, fpr_i, tpr_i)
-        interp_tpr[0] = 0.0
-        boot_tprs_int.append(interp_tpr)
-
-        # PR（bootstrap 模型 → 原始数据）
-        prec_i, rec_i, _ = precision_recall_curve(y_dev, prob_on_orig)
-        sorted_idx = np.argsort(rec_i)
-        interp_prec = np.interp(mean_recall, rec_i[sorted_idx], prec_i[sorted_idx])
-        boot_precs_int.append(interp_prec)
-
-        # ========== Part B: OOF Bootstrap 重采样 ==========
-        idx_oof = np.random.choice(len(y_int), size=len(y_int), replace=True)
-        y_oof_b = y_int[idx_oof]
-        p_oof_b = prob_int[idx_oof]
-
-        if len(np.unique(y_oof_b)) >= 2:
-            fpr_o, tpr_o, _ = roc_curve(y_oof_b, p_oof_b)
-            interp_tpr_o = np.interp(mean_fpr, fpr_o, tpr_o)
-            interp_tpr_o[0] = 0.0
-            boot_tprs_oof.append(interp_tpr_o)
-            boot_auc_oof.append(roc_auc_score(y_oof_b, p_oof_b))
-
-            prec_o, rec_o, _ = precision_recall_curve(y_oof_b, p_oof_b)
-            sorted_idx_o = np.argsort(rec_o)
-            interp_prec_o = np.interp(mean_recall, rec_o[sorted_idx_o], prec_o[sorted_idx_o])
-            boot_precs_oof.append(interp_prec_o)
-            boot_ap_oof.append(average_precision_score(y_oof_b, p_oof_b))
-
-        success_count += 1
-
-    except Exception as e:
-        fail_count += 1
-        if fail_count <= 3:
-            print(f"    ⚠️ 第 {i+1} 次迭代失败: {e}")
-        continue
-
-elapsed_total = time.time() - start_time
-print(f"\n  ✓ Bootstrap 完成: {success_count} 成功, {fail_count} 失败")
-print(f"  ✓ 总耗时: {elapsed_total:.1f} 秒")
-
-# ------------------------------------------
-# 3.5 Optimism-Corrected 指标
-# ------------------------------------------
-print("\n[Step 5] 计算 Optimism-Corrected 指标...")
-
-mean_optimism_auc = np.mean(optimism_auc_list)
-std_optimism_auc = np.std(optimism_auc_list)
-corrected_auc = apparent_auc - mean_optimism_auc
-
-mean_optimism_ap = np.mean(optimism_ap_list)
-std_optimism_ap = np.std(optimism_ap_list)
-corrected_ap = apparent_ap - mean_optimism_ap
-
-mean_optimism_brier = np.mean(optimism_brier_list)
-corrected_brier = apparent_brier - mean_optimism_brier
-
-ext_auc = roc_auc_score(y_ext, prob_ext)
-ext_brier = brier_score_loss(y_ext, prob_ext)
-ext_ap = average_precision_score(y_ext, prob_ext)
-
-print(f"\n  {'='*65}")
-print(f"  {'指标':<30} {'AUC':>10} {'AP':>10} {'Brier':>10}")
-print(f"  {'-'*65}")
-print(f"  {'Apparent (训练集):':<30} {apparent_auc:>10.4f} {apparent_ap:>10.4f} {apparent_brier:>10.4f}")
-print(f"  {'Mean Optimism:':<30} {mean_optimism_auc:>10.4f} {mean_optimism_ap:>10.4f} {mean_optimism_brier:>10.4f}")
-print(f"  {'Optimism-Corrected:':<30} {corrected_auc:>10.4f} {corrected_ap:>10.4f} {corrected_brier:>10.4f}")
-print(f"  {'OOF (5×20 CV):':<30} {oof_auc:>10.4f} {oof_ap:>10.4f} {oof_brier:>10.4f}")
-print(f"  {'External Validation:':<30} {ext_auc:>10.4f} {ext_ap:>10.4f} {ext_brier:>10.4f}")
-print(f"  {'='*65}")
-print(f"\n  📊 AUC Optimism: {mean_optimism_auc:.4f} ± {std_optimism_auc:.4f}")
-print(f"  📊 AP  Optimism: {mean_optimism_ap:.4f} ± {std_optimism_ap:.4f}")
-print(f"  📊 |Corrected AUC - OOF|      = {abs(corrected_auc - oof_auc):.4f}")
-print(f"  📊 |Corrected AUC - External|  = {abs(corrected_auc - ext_auc):.4f}")
-
-if mean_optimism_auc < 0.02:
-    print("  ✅ AUC Optimism < 0.02 → 过拟合程度极低")
-elif mean_optimism_auc < 0.05:
-    print("  ✅ AUC Optimism < 0.05 → 过拟合程度可控")
-else:
-    print("  ⚠️ AUC Optimism ≥ 0.05 → 存在一定过拟合风险")
-
-# ------------------------------------------
-# 3.6 保存
-# ------------------------------------------
-print("\n[Step 6] 保存内部 Bootstrap 数据...")
-
-df_internal_boot = pd.DataFrame({
-    'AUC_boot': auc_boot_list,
-    'AUC_orig': auc_orig_list,
-    'Optimism_AUC': optimism_auc_list,
-    'Optimism_AP': optimism_ap_list,
-    'Optimism_Brier': optimism_brier_list
-})
-df_internal_boot.to_csv(f"{DATA_PATH}/Internal_Bootstrap_Optimism_{TIMESTAMP}.csv", index=False)
-
-df_optimism_summary = pd.DataFrame({
-    'Metric': ['AUC', 'AP', 'Brier Score'],
-    'Apparent': [apparent_auc, apparent_ap, apparent_brier],
-    'Mean_Optimism': [mean_optimism_auc, mean_optimism_ap, mean_optimism_brier],
-    'Optimism_Corrected': [corrected_auc, corrected_ap, corrected_brier],
-    'OOF_CV': [oof_auc, oof_ap, oof_brier],
-    'External': [ext_auc, ext_ap, ext_brier]
-})
-df_optimism_summary.to_csv(f"{DATA_PATH}/Optimism_Correction_Summary_{TIMESTAMP}.csv", index=False)
-print("  ✓ 已保存")
-
-
-# ==============================================================
-# 4. 外部 Bootstrap 曲线数据
-# ==============================================================
-print("\n[Step 7] 计算外部 Bootstrap 曲线数据...")
-
-tprs_external = []
-precs_external = []
-aucs_external = []
-aps_external = []
-
-for boot_pred in bootstrap_predictions:
-    y_true_b = boot_pred['true_labels']
-    y_pred_b = boot_pred['pred_probs']
-
-    if len(np.unique(y_true_b)) < 2:
-        continue
-
-    fpr_e, tpr_e, _ = roc_curve(y_true_b, y_pred_b)
-    interp_tpr = np.interp(mean_fpr, fpr_e, tpr_e)
-    interp_tpr[0] = 0.0
-    tprs_external.append(interp_tpr)
-    aucs_external.append(roc_auc_score(y_true_b, y_pred_b))
-
-    prec_e, rec_e, _ = precision_recall_curve(y_true_b, y_pred_b)
-    sorted_idx = np.argsort(rec_e)
-    interp_prec = np.interp(mean_recall, rec_e[sorted_idx], prec_e[sorted_idx])
-    precs_external.append(interp_prec)
-    aps_external.append(average_precision_score(y_true_b, y_pred_b))
-
-tprs_external = np.array(tprs_external)
-precs_external = np.array(precs_external)
-
-mean_tpr_ext = tprs_external.mean(axis=0)
-std_tpr_ext = tprs_external.std(axis=0)
-upper_tpr_ext = np.minimum(mean_tpr_ext + 1.96 * std_tpr_ext, 1)
-lower_tpr_ext = np.maximum(mean_tpr_ext - 1.96 * std_tpr_ext, 0)
-mean_auc_ext = np.mean(aucs_external)
-std_auc_ext = np.std(aucs_external)
-
-mean_prec_ext = precs_external.mean(axis=0)
-std_prec_ext = precs_external.std(axis=0)
-upper_prec_ext = np.minimum(mean_prec_ext + 1.96 * std_prec_ext, 1)
-lower_prec_ext = np.maximum(mean_prec_ext - 1.96 * std_prec_ext, 0)
-mean_ap_ext_boot = np.mean(aps_external)
-std_ap_ext_boot = np.std(aps_external)
-
-print(f"  ✓ 外部 ROC: Mean AUC = {mean_auc_ext:.4f} ± {std_auc_ext:.4f}")
-print(f"  ✓ 外部 PR:  Mean AP  = {mean_ap_ext_boot:.4f} ± {std_ap_ext_boot:.4f}")
-
-
-# ==============================================================
-# 5. CI 带统计量
-# ==============================================================
-
-# 内部 Harrell Bootstrap
-boot_tprs_int = np.array(boot_tprs_int)
-boot_precs_int = np.array(boot_precs_int)
-
-mean_tpr_int = boot_tprs_int.mean(axis=0)
-std_tpr_int = boot_tprs_int.std(axis=0)
-upper_tpr_int = np.minimum(mean_tpr_int + 1.96 * std_tpr_int, 1)
-lower_tpr_int = np.maximum(mean_tpr_int - 1.96 * std_tpr_int, 0)
-mean_auc_int_boot = np.mean(auc_orig_list)
-std_auc_int_boot = np.std(auc_orig_list)
-
-mean_prec_int = boot_precs_int.mean(axis=0)
-std_prec_int = boot_precs_int.std(axis=0)
-upper_prec_int = np.minimum(mean_prec_int + 1.96 * std_prec_int, 1)
-lower_prec_int = np.maximum(mean_prec_int - 1.96 * std_prec_int, 0)
-
-# OOF Bootstrap 重采样
-boot_tprs_oof = np.array(boot_tprs_oof)
-boot_precs_oof = np.array(boot_precs_oof)
-
-mean_tpr_oof = boot_tprs_oof.mean(axis=0)
-std_tpr_oof = boot_tprs_oof.std(axis=0)
-upper_tpr_oof = np.minimum(mean_tpr_oof + 1.96 * std_tpr_oof, 1)
-lower_tpr_oof = np.maximum(mean_tpr_oof - 1.96 * std_tpr_oof, 0)
-mean_auc_oof_boot = np.mean(boot_auc_oof)
-std_auc_oof_boot = np.std(boot_auc_oof)
-
-mean_prec_oof = boot_precs_oof.mean(axis=0)
-std_prec_oof = boot_precs_oof.std(axis=0)
-upper_prec_oof = np.minimum(mean_prec_oof + 1.96 * std_prec_oof, 1)
-lower_prec_oof = np.maximum(mean_prec_oof - 1.96 * std_prec_oof, 0)
-mean_ap_oof_boot = np.mean(boot_ap_oof)
-std_ap_oof_boot = np.std(boot_ap_oof)
-
-# 原始曲线
-fpr_oof_orig, tpr_oof_orig, _ = roc_curve(y_int, prob_int)
-fpr_ext_orig, tpr_ext_orig, _ = roc_curve(y_ext, prob_ext)
-prec_oof_orig, rec_oof_orig, _ = precision_recall_curve(y_int, prob_int)
-prec_ext_orig, rec_ext_orig, _ = precision_recall_curve(y_ext, prob_ext)
-
-prevalence_int = y_int.mean()
-prevalence_ext = y_ext.mean()
-
-
-# ==============================================================
-# 6. 可视化
-# ==============================================================
-print("\n" + "="*70)
-print("  可视化：SCI 顶刊风格 ROC & PR CI 带 + Optimism 分析")
-print("="*70)
-
-FIG_SINGLE = (3.5, 3.5)     # 单栏正方形
-FIG_WIDE   = (7.2, 3.5)     # 双栏宽图
-FIG_PANEL  = (7.2, 7.0)     # 2×2 面板
-
-# ==================== 图1：ROC — 仅内部 ====================
-fig, ax = plt.subplots(figsize=FIG_SINGLE)
-
-ax.fill_between(mean_fpr, lower_tpr_int, upper_tpr_int,
-                color=C_INT, alpha=0.15, label='95% CI')
-ax.plot(mean_fpr, mean_tpr_int, color=C_INT, lw=1.5,
-        label=f'Bootstrap mean (AUC = {mean_auc_int_boot:.3f})')
-ax.plot(fpr_oof_orig, tpr_oof_orig, color=C_OOF_LINE, lw=1.2, ls='--',
-        label=f'OOF (AUC = {oof_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_title('Internal Validation', fontsize=10)
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-sci_legend(ax, loc='lower right')
-
-plt.tight_layout()
-plt.savefig('figures/ROC_CI_Internal.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_CI_Internal.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/ROC_CI_Internal.png / .pdf")
-plt.close()
-
-# ==================== 图2：ROC — 仅外部 ====================
-fig, ax = plt.subplots(figsize=FIG_SINGLE)
-
-ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext,
-                color=C_EXT, alpha=0.15, label='95% CI')
-ax.plot(mean_fpr, mean_tpr_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AUC = {mean_auc_ext:.3f})')
-ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AUC = {ext_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_title('External Validation', fontsize=10)
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-sci_legend(ax, loc='lower right')
-
-plt.tight_layout()
-plt.savefig('figures/ROC_CI_External.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_CI_External.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/ROC_CI_External.png / .pdf")
-plt.close()
-
-# ==================== 图3：ROC — 合并 ====================
-fig, ax = plt.subplots(figsize=FIG_SINGLE)
-
-ax.fill_between(mean_fpr, lower_tpr_int, upper_tpr_int, color=C_INT, alpha=0.12)
-ax.plot(mean_fpr, mean_tpr_int, color=C_INT, lw=1.5,
-        label=f'Internal (AUC = {mean_auc_int_boot:.3f})')
-ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext, color=C_EXT, alpha=0.12)
-ax.plot(mean_fpr, mean_tpr_ext, color=C_EXT, lw=1.5,
-        label=f'External (AUC = {mean_auc_ext:.3f})')
-ax.plot(fpr_oof_orig, tpr_oof_orig, color=C_OOF_LINE, lw=1.0, ls='--',
-        label=f'Internal OOF (AUC = {oof_auc:.3f})')
-ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT_LINE, lw=1.0, ls='--',
-        label=f'External original (AUC = {ext_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-sci_legend(ax, loc='lower right')
-
-plt.tight_layout()
-plt.savefig('figures/ROC_CI_Combined.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_CI_Combined.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/ROC_CI_Combined.png / .pdf")
-plt.close()
-
-# ==================== 图4：PR — 仅内部 ====================
-fig, ax = plt.subplots(figsize=(3.5, 3.5))
-
-ax.fill_between(mean_recall, lower_prec_int, upper_prec_int,
-                color=C_INT, alpha=0.15, label='95% CI')
-ax.plot(mean_recall, mean_prec_int, color=C_INT, lw=1.5,
-        label=f'Bootstrap mean (AP = {corrected_ap:.3f})')
-ax.plot(rec_oof_orig, prec_oof_orig, color=C_OOF_LINE, lw=1.2, ls='--',
-        label=f'OOF (AP = {oof_ap:.3f})')
-ax.axhline(y=prevalence_int, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_int:.3f}')
-ax.set_title('Internal Validation', fontsize=10)
-ax.set_xlabel('Recall (Sensitivity)')
-ax.set_ylabel('Precision (PPV)')
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.05])
-sci_legend(ax, loc='lower left')
-
-plt.tight_layout()
-plt.savefig('figures/PR_CI_Internal.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/PR_CI_Internal.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/PR_CI_Internal.png / .pdf")
-plt.close()
-
-# ==================== 图5：PR — 仅外部 ====================
-fig, ax = plt.subplots(figsize=(3.5, 3.5))
-
-ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext,
-                color=C_EXT, alpha=0.15, label='95% CI')
-ax.plot(mean_recall, mean_prec_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AP = {mean_ap_ext_boot:.3f})')
-ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AP = {ext_ap:.3f})')
-ax.axhline(y=prevalence_ext, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_ext:.3f}')
-ax.set_title('External Validation', fontsize=10)
-ax.set_xlabel('Recall (Sensitivity)')
-ax.set_ylabel('Precision (PPV)')
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.05])
-sci_legend(ax, loc='lower left')
-
-plt.tight_layout()
-plt.savefig('figures/PR_CI_External.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/PR_CI_External.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/PR_CI_External.png / .pdf")
-plt.close()
-
-# ==================== 图6：PR — 合并 ====================
-fig, ax = plt.subplots(figsize=FIG_SINGLE)
-
-ax.fill_between(mean_recall, lower_prec_int, upper_prec_int, color=C_INT, alpha=0.12)
-ax.plot(mean_recall, mean_prec_int, color=C_INT, lw=1.5,
-        label=f'Internal (AP = {corrected_ap:.3f})')
-ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext, color=C_EXT, alpha=0.12)
-ax.plot(mean_recall, mean_prec_ext, color=C_EXT, lw=1.5,
-        label=f'External (AP = {mean_ap_ext_boot:.3f})')
-ax.plot(rec_oof_orig, prec_oof_orig, color=C_OOF_LINE, lw=1.0, ls='--',
-        label=f'Internal OOF (AP = {oof_ap:.3f})')
-ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT_LINE, lw=1.0, ls='--',
-        label=f'External original (AP = {ext_ap:.3f})')
-ax.axhline(y=prevalence_int, color=C_INT, ls=':', lw=0.8, alpha=0.5,
-           label=f'Int. prevalence = {prevalence_int:.3f}')
-ax.axhline(y=prevalence_ext, color=C_EXT, ls=':', lw=0.8, alpha=0.5,
-           label=f'Ext. prevalence = {prevalence_ext:.3f}')
-
-ax.set_xlabel('Recall (Sensitivity)')
-ax.set_ylabel('Precision (PPV)')
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.05])
-sci_legend(ax, loc='upper right')
-
-plt.tight_layout()
-plt.savefig('figures/PR_CI_Combined.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/PR_CI_Combined.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/PR_CI_Combined.png / .pdf")
-plt.close()
-
-# ==================== 图7：Optimism 分布（三面板）====================
-fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.5))
-
-for ax, data, metric, color in zip(
-    axes,
-    [optimism_auc_list, optimism_ap_list, optimism_brier_list],
-    ['AUC', 'AP', 'Brier'],
-    [C_INT, C_CORRECT, C_BRIER]
-):
-    mean_val = np.mean(data)
-    ax.hist(data, bins=35, color=color, alpha=0.7, edgecolor='white', lw=0.3)
-    ax.axvline(mean_val, color=C_EXT, lw=1.2, ls='--',
-               label=f'Mean = {mean_val:.4f}')
-    ax.axvline(0, color='#333333', lw=0.6, alpha=0.5)
-    ax.set_xlabel(f'Optimism ({metric})')
-    ax.set_ylabel('Frequency')
-    sci_legend(ax, loc='upper right')
-
-plt.tight_layout()
-plt.savefig('figures/Optimism_Distribution.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/Optimism_Distribution.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/Optimism_Distribution.png / .pdf")
-plt.close()
-
-# ==================== 图8：AUC + AP 对比柱状图 ====================
-fig, axes = plt.subplots(1, 2, figsize=FIG_WIDE)
-
-bar_colors = [C_APPARENT, C_CORRECT, C_INT, C_EXT]
-labels = ['Apparent', 'Optimism-\ncorrected', 'OOF\n(5×20 CV)', 'External']
-
-for ax, metric_name, values, optimism_val in zip(
-    axes,
-    ['AUC', 'AP'],
-    [
-        [apparent_auc, corrected_auc, oof_auc, ext_auc],
-        [apparent_ap, corrected_ap, oof_ap, ext_ap]
-    ],
-    [mean_optimism_auc, mean_optimism_ap]
-):
-    bars = ax.bar(labels, values, color=bar_colors, edgecolor='white', linewidth=0.5, width=0.6)
-
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.003,
-                f'{val:.3f}', ha='center', va='bottom')
-
-    # Optimism 箭头
-    ax.annotate('', xy=(1, values[1]), xytext=(0, values[0]),
-                arrowprops=dict(arrowstyle='->', color=C_EXT, lw=1.5, ls='--'))
-    mid_y = (values[0] + values[1]) / 2
-    ax.text(0.5, mid_y + 0.003, f'Optimism\n= {optimism_val:.4f}',
-            ha='center', va='bottom', color=C_EXT)
-
-    y_min = min(values) - 0.05
-    y_max = max(values) + 0.04
-    ax.set_ylim([y_min, y_max])
-    ax.set_ylabel(metric_name)
-    ax.axhline(y=values[1], color=C_CORRECT, alpha=0.3, ls=':', lw=0.8)
-
-plt.tight_layout()
-plt.savefig('figures/AUC_AP_Comparison_Optimism.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/AUC_AP_Comparison_Optimism.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/AUC_AP_Comparison_Optimism.png / .pdf")
-plt.close()
-
-# ==================== 图9：AUC + AP 一致性点线图 ====================
-fig, axes = plt.subplots(1, 2, figsize=FIG_WIDE)
-
-methods = ['Apparent', 'Optimism-\ncorrected', 'OOF CV', 'External']
-dot_colors = [C_APPARENT, C_CORRECT, C_INT, C_EXT]
-
-for ax, metric_name, values, std_corr, std_ext in zip(
-    axes,
-    ['AUC', 'AP'],
-    [
-        [apparent_auc, corrected_auc, oof_auc, ext_auc],
-        [apparent_ap, corrected_ap, oof_ap, ext_ap]
-    ],
-    [std_optimism_auc, std_optimism_ap],
-    [std_auc_ext, std_ap_ext_boot]
-):
-    # CI 计算
-    ci_lo = [values[0], values[1] - 1.96 * std_corr,
-             values[2], values[3] - 1.96 * std_ext]
-    ci_hi = [values[0], values[1] + 1.96 * std_corr,
-             values[2], values[3] + 1.96 * std_ext]
-
-    # OOF CI
-    if df_cv_detail is not None and metric_name in df_cv_detail.columns:
-        cv_std = df_cv_detail[metric_name].std()
-        ci_lo[2] = values[2] - 1.96 * cv_std
-        ci_hi[2] = values[2] + 1.96 * cv_std
+def model_label(name):
+    """模型代码名 → 出版展示名"""
+    return MODEL_LABEL_MAP.get(str(name), str(name).replace('_', ' '))
+
+
+# ---------------- 模型对比配色 / 标记 ----------------
+#   蓝(#3C5488) = 队列「内部」、红(#E64B35) = 队列「外部」，语义已被正文占用；
+#   模型对比统一使用 深蓝 → 青绿 → 红 → 橙 的顺序，队列信息由图题与文件名承担。
+_MODEL_PALETTE = [COLORS_LIST[3], COLORS_LIST[2], COLORS_LIST[0], COLORS_LIST[4],
+                  COLORS_LIST[5], COLORS_LIST[8]]
+_MODEL_MARKERS = ['o', 's', '^', 'D', 'v', 'P']
+
+
+def model_style(names):
+    """为一组模型分配稳定的颜色与散点标记"""
+    return {n: {'color': _MODEL_PALETTE[i % len(_MODEL_PALETTE)],
+                'marker': _MODEL_MARKERS[i % len(_MODEL_MARKERS)]}
+            for i, n in enumerate(names)}
+
+
+# ---------------- 通用小工具 ----------------
+def _supp_save(save_path, dpi=DPI):
+    """统一保存 PNG + PDF（与正文图一致）"""
+    plt.savefig(save_path, dpi=dpi, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.savefig(save_path.rsplit('.', 1)[0] + '.pdf', bbox_inches='tight')
+    print(f"  ✓ 已保存: {save_path} / .pdf")
+    plt.close()
+
+
+def _find_latest(pattern):
+    """按修改时间取最新的匹配文件（S 系列文件用的是自己的时间戳）"""
+    files = glob.glob(pattern)
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def _youden_threshold(y_true, y_prob):
+    """开发集 OOF 上的 Youden 阈值，锁定后用于外部（与 comprehensive_analysis 同口径）"""
+    fpr, tpr, thr = roc_curve(np.asarray(y_true), np.asarray(y_prob))
+    return round(float(thr[np.argmax(tpr - fpr)]), 2)
+
+
+def _fmt_p(p):
+    return '<0.001' if p < 0.001 else f'{p:.3f}'
+
+
+# ==========================================================================================
+# 9.1 通用绘图函数（校准 / DCA / 一致性 / 森林图）—— 均为本脚本风格
+# ==========================================================================================
+def plot_calibration_multi(series, save_path, n_bootstrap=SUPP_N_BOOT_CAL,
+                           show_spike=True, note=None, figsize=(3.5, 3.5),
+                           legend_loc='lower right', record_tag=None):
+    """
+    多曲线校准图 —— 与正文面板 E（plot_calibration_publication_v2）同款视觉语法，
+    区别仅在于「一条曲线 = 一个模型」而非「一个队列」。
+
+    series : list of dict(y=…, prob=…, label=…, color=…, marker=…)
+    note   : 左上角小字注释（如样本量、事件数）
+    """
+    series = [s for s in series if s.get('y') is not None and len(s['y']) > 0]
+    if not series:
+        print("  ⚠️ 无可绘制数据，跳过")
+        return None
+
+    fig = plt.figure(figsize=figsize)
+    if show_spike:
+        gs = gridspec.GridSpec(2, 1, height_ratios=[5.5, 1], hspace=0.05,
+                               left=0.12, right=0.95, top=0.93, bottom=0.08)
+        ax_main  = fig.add_subplot(gs[0])
+        ax_spike = fig.add_subplot(gs[1], sharex=ax_main)
     else:
-        oof_std = std_auc_oof_boot if metric_name == 'AUC' else np.std(boot_ap_oof)
-        ci_lo[2] = values[2] - 1.96 * oof_std
-        ci_hi[2] = values[2] + 1.96 * oof_std
+        ax_main, ax_spike = fig.add_subplot(111), None
 
-    for j, (val, lo, hi, c) in enumerate(zip(values, ci_lo, ci_hi, dot_colors)):
-        ax.errorbar(j, val, yerr=[[val - lo], [hi - val]], fmt='o', markersize=6,
-                    color=c, ecolor=c, elinewidth=1.5, capsize=4, capthick=1.2,
-                    markeredgecolor='white', markeredgewidth=0.8, zorder=5)
-        ax.text(j, hi + 0.006, f'{val:.3f}', ha='center', fontweight='bold', color=c)
+    np.random.seed(42)                     # 置信带可复现
 
-    ax.plot(range(4), values, color='#AAAAAA', ls='--', lw=0.8, zorder=1)
+    for ds in series:
+        y = np.asarray(ds['y'], dtype=int)
+        p = np.asarray(ds['prob'], dtype=float)
+        col, mk = ds['color'], ds.get('marker', 'o')
 
-    # 一致性范围高亮
-    ax.axhspan(min(values[1:]), max(values[1:]), alpha=0.05, color=C_CORRECT)
+        # --- A. 统计量（进图例 / 汇总 CSV）---
+        slope, intercept = get_cali_stats(y, p)
+        hl_stat, hl_pval = hosmer_lemeshow_test(y, p, n_groups=10)
+        brier = brier_score_loss(y, p)
+        oe    = y.sum() / p.sum() if p.sum() > 0 else np.nan
 
-    ax.set_xticks(range(4))
-    ax.set_xticklabels(methods)
-    ax.set_ylabel(metric_name)
+        print(f"    {ds['label']:<28} N={len(y):>4}  Events={int(y.sum()):>3} "
+              f"({y.mean():.1%})  Slope={slope:.3f}  Intercept={intercept:.3f}  "
+              f"Brier={brier:.4f}  O:E={oe:.3f}  H-L p={_fmt_p(hl_pval)}")
 
-    consistency = max(values[1:]) - min(values[1:])
-    ax.text(0.97, 0.03,
-            f'Δ range = {consistency:.4f}',
-            transform=ax.transAxes, ha='right', va='bottom',
-            style='italic',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='#FFFDE7',
-                      edgecolor='#E0E0E0', alpha=0.9))
+        _SUPP_STATS_ROWS.append({
+            'Figure': record_tag or os.path.basename(save_path),
+            'Series': ds['label'], 'N': len(y), 'Events': int(y.sum()),
+            'Event_rate': y.mean(), 'Cal_slope': slope, 'Cal_intercept': intercept,
+            'Brier': brier, 'OE': oe, 'HL_chi2': hl_stat, 'HL_p': hl_pval,
+        })
 
-plt.tight_layout()
-plt.savefig('figures/AUC_AP_Consistency_Overview.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/AUC_AP_Consistency_Overview.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/AUC_AP_Consistency_Overview.png / .pdf")
-plt.close()
+        # --- B. 自适应等频分 bin + Wilson CI ---
+        min_per_bin = max(15, int(len(y) * 0.04))
+        bins = adaptive_calibration_bins(y, p, min_samples=min_per_bin, max_bins=10)
 
-# ==================== 图10：2×2 ROC + PR 总览面板 ====================
-fig, axes = plt.subplots(2, 2, figsize=FIG_PANEL)
+        if len(bins['pred']) > 0:
+            size_min, size_max = 15, 45
+            if bins['n'].max() > bins['n'].min():
+                sizes = size_min + (size_max - size_min) * \
+                    (bins['n'] - bins['n'].min()) / (bins['n'].max() - bins['n'].min())
+            else:
+                sizes = np.full(len(bins['n']), (size_min + size_max) / 2)
 
-# --- (0,0) ROC Internal ---
-ax = axes[0, 0]
-ax.fill_between(mean_fpr, lower_tpr_int, upper_tpr_int, color=C_INT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_int, color=C_INT, lw=1.5,
-        label=f'Mean (AUC = {mean_auc_int_boot:.3f})')
-ax.plot(fpr_oof_orig, tpr_oof_orig, color=C_OOF_LINE, lw=1.0, ls='--',
-        label=f'OOF (AUC = {oof_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'A', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+            ax_main.errorbar(
+                bins['pred'], bins['true'],
+                yerr=[bins['true'] - bins['ci_low'], bins['ci_up'] - bins['true']],
+                fmt='none', ecolor=col, elinewidth=0.6,
+                capsize=1.5, capthick=0.6, alpha=0.45, zorder=3)
 
-# --- (0,1) ROC External ---
-ax = axes[0, 1]
-ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_ext, color=C_EXT, lw=1.5,
-        label=f'Mean (AUC = {mean_auc_ext:.3f})')
-ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT_LINE, lw=1.0, ls='--',
-        label=f'Original (AUC = {ext_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'B', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+            ax_main.scatter(bins['pred'], bins['true'], s=sizes, marker=mk,
+                            facecolors=col, edgecolors=col,
+                            linewidths=0.7, alpha=0.85, zorder=4)
 
-# --- (1,0) PR Internal ---
-ax = axes[1, 0]
-ax.fill_between(mean_recall, lower_prec_int, upper_prec_int, color=C_INT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_int, color=C_INT, lw=1.5,
-        label=f'Mean (AP = {corrected_ap:.3f})')
-ax.plot(rec_oof_orig, prec_oof_orig, color=C_OOF_LINE, lw=1.0, ls='--',
-        label=f'OOF (AP = {oof_ap:.3f})')
-ax.axhline(y=prevalence_int, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_int:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'C', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+        # --- C. logistic 重校准拟合线（图例带统计量）---
+        x_fit, y_fit, _, _ = logistic_calibration_curve(y, p)
+        ax_main.plot(x_fit, y_fit, color=col, lw=1.5, alpha=0.85, zorder=5,
+                     label=f"{ds['label']} (Slope = {slope:.2f}, Brier = {brier:.3f})")
 
-# --- (1,1) PR External ---
-ax = axes[1, 1]
-ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_ext, color=C_EXT, lw=1.5,
-        label=f'Mean (AP = {mean_ap_ext_boot:.3f})')
-ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT_LINE, lw=1.0, ls='--',
-        label=f'Original (AP = {ext_ap:.3f})')
-ax.axhline(y=prevalence_ext, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_ext:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'D', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+        # --- D. bootstrap 95% 带 ---
+        try:
+            x_ci, ci_low, ci_up = bootstrap_logistic_cal_ci(
+                y, p, n_bootstrap=n_bootstrap)
+            ax_main.fill_between(x_ci, ci_low, ci_up, color=col, alpha=0.15, zorder=1)
+        except Exception as e:
+            print(f"    ⚠️ {ds['label']} bootstrap 带失败: {e}")
 
-plt.tight_layout()
-plt.savefig('figures/ROC_PR_Panel_Overview.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_PR_Panel_Overview.pdf', bbox_inches='tight')
-print("  ✓ 已保存: figures/ROC_PR_Panel_Overview.png / .pdf")
-plt.close()
+    # --- E. 理想校准线 ---
+    ax_main.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--',
+                 zorder=2, label='Ideal')
 
+    ax_main.set_ylabel('Observed proportion')
+    ax_main.set_xlim([-0.02, 1.02])
+    ax_main.set_ylim([-0.02, 1.02])
+    ax_main.set_aspect('equal')
+    ax_main.spines['top'].set_visible(False)
+    ax_main.spines['right'].set_visible(False)
+    if note:
+        ax_main.text(0.03, 0.97, note, transform=ax_main.transAxes, fontsize=6.5,
+                     color='#555555', va='top', ha='left')
+    sci_legend(ax_main, loc=legend_loc, fontsize=6.5)
 
-# ==============================================================
-# 总结
-# ==============================================================
-print("\n" + "="*70)
-print("  ✅ 全部完成！共生成 10 张图（均有 PNG + PDF）：")
-print("  ─────────────────────────────────────────────")
-print("  ROC 系列：")
-print("    1.  figures/ROC_CI_Internal.png")
-print("    2.  figures/ROC_CI_External.png")
-print("    3.  figures/ROC_CI_Combined.png")
-print("  PR 系列：")
-print("    4.  figures/PR_CI_Internal.png")
-print("    5.  figures/PR_CI_External.png")
-print("    6.  figures/PR_CI_Combined.png")
-print("  Optimism 分析：")
-print("    7.  figures/Optimism_Distribution.png")
-print("    8.  figures/AUC_AP_Comparison_Optimism.png")
-print("    9.  figures/AUC_AP_Consistency_Overview.png")
-print("  综合面板：")
-print("    10. figures/ROC_PR_Panel_Overview.png")
-print("  ─────────────────────────────────────────────")
-print("  CSV 输出：")
-print(f"    • {DATA_PATH}/Internal_Bootstrap_Optimism_{TIMESTAMP}.csv")
-print(f"    • {DATA_PATH}/Optimism_Correction_Summary_{TIMESTAMP}.csv")
-print("="*70)
+    # --- F. 底部 spike 直方图 ---
+    if show_spike:
+        ax_main.set_xlabel('')
+        ax_main.tick_params(axis='x', labelbottom=False)
 
-# ==============================================================
-# 补充计算：OOF bootstrap resample 的平均曲线
-# ==============================================================
+        spike_bins = np.linspace(0, 1, 41)
+        bw = spike_bins[1] - spike_bins[0]
+        offsets = np.linspace(-0.002, 0.002, max(len(series), 2))
 
-# OOF resample 的平均 ROC
-mean_tpr_oof_smooth = boot_tprs_oof.mean(axis=0)
-# OOF resample 的平均 PR
-mean_prec_oof_smooth = boot_precs_oof.mean(axis=0)
+        for k, ds in enumerate(series):
+            y = np.asarray(ds['y'], dtype=int)
+            p = np.asarray(ds['prob'], dtype=float)
+            centers = (spike_bins[:-1] + spike_bins[1:]) / 2 + offsets[k]
 
-# Apparent 曲线（用于方案 B）
-fpr_apparent, tpr_apparent, _ = roc_curve(y_dev, prob_apparent)
-prec_apparent, rec_apparent, _ = precision_recall_curve(y_dev, prob_apparent)
+            counts_pos, _ = np.histogram(p[y == 1], bins=spike_bins)
+            ax_spike.bar(centers, counts_pos, width=bw * 0.45,
+                         color=ds['color'], alpha=0.6, edgecolor='none')
+
+            counts_neg, _ = np.histogram(p[y == 0], bins=spike_bins)
+            neg_scale = max(counts_pos.max(), 1) / max(counts_neg.max(), 1) * 0.8
+            ax_spike.bar(centers, -counts_neg * neg_scale, width=bw * 0.45,
+                         color=ds['color'], alpha=0.25, edgecolor='none')
+
+        ax_spike.axhline(y=0, color='#888888', linewidth=0.6)
+        ax_spike.set_xlabel('Predicted probability')
+        ax_spike.set_xlim([-0.02, 1.02])
+        ax_spike.spines['top'].set_visible(False)
+        ax_spike.spines['right'].set_visible(False)
+        ax_spike.set_yticks([])
+        ax_spike.text(0.01, 0.92, 'Events', transform=ax_spike.transAxes,
+                      fontsize=6.5, color='#555555', va='top', fontstyle='italic')
+        ax_spike.text(0.01, 0.08, 'Non-events', transform=ax_spike.transAxes,
+                      fontsize=6.5, color='#555555', va='bottom', fontstyle='italic')
+    else:
+        ax_main.set_xlabel('Predicted probability')
+
+    _supp_save(save_path)
+    return fig
 
 
-# ==============================================================
-# 图10-D：2×2 面板
-# ==============================================================
-print("\n绘制 2×2 面板（方案 D：Harrell mean + OOF resample mean）...")
+def plot_dca_multi(series, save_path, locked_threshold=None, xmax=SUPP_DCA_XMAX,
+                   n_bootstrap=SUPP_N_BOOT_DCA, figsize=(3.5, 5), record_tag=None):
+    """
+    多模型决策曲线 —— 与正文面板 F 同款「主面板 + 每 1000 人高风险数」双层结构。
 
-fig, axes = plt.subplots(2, 2, figsize=FIG_PANEL)
+    series : list of dict(y=…, prob=…, label=…, color=…)
+             同一张图内各条曲线应来自同一队列（Treat all 取第一条的结局率）
+    """
+    series = [s for s in series if s.get('y') is not None and len(s['y']) > 0]
+    if not series:
+        print("  ⚠️ 无可绘制数据，跳过")
+        return None
 
-# --- (0,0) ROC Internal ---
-ax = axes[0, 0]
-ax.fill_between(mean_fpr, lower_tpr_int, upper_tpr_int, color=C_INT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_int, color=C_INT, lw=1.5,
-        label=f'Harrell corrected (AUC = {mean_auc_int_boot:.3f})')
-ax.plot(mean_fpr, mean_tpr_oof_smooth, color=C_OOF_LINE, lw=1.2, ls='--',
-        label=f'OOF resampled (AUC = {mean_auc_oof_boot:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'A', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+    threshs = np.arange(0, 1.01, 0.01)
+    prevalence = np.asarray(series[0]['y'], dtype=int).mean()
+    all_nb = prevalence - (1 - prevalence) * (threshs / (1 - threshs + 1e-10))
 
-# --- (0,1) ROC External ---
-ax = axes[0, 1]
-ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AUC = {mean_auc_ext:.3f})')
-ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AUC = {ext_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'B', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 0.5], hspace=0.3)
+    ax_main = fig.add_subplot(gs[0])
+    ax_num  = fig.add_subplot(gs[1], sharex=ax_main)
 
-# --- (1,0) PR Internal ---
-ax = axes[1, 0]
-ax.fill_between(mean_recall, lower_prec_int, upper_prec_int, color=C_INT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_int, color=C_INT, lw=1.5,
-        label=f'Harrell corrected (AP = {corrected_ap:.3f})')
-ax.plot(mean_recall, mean_prec_oof_smooth, color=C_OOF_LINE, lw=1.2, ls='--',
-        label=f'OOF resampled (AP = {mean_ap_oof_boot:.3f})')
-ax.axhline(y=prevalence_int, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_int:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'C', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+    y_max_candidates = [all_nb[threshs <= xmax].max()]
 
-# --- (1,1) PR External ---
-ax = axes[1, 1]
-ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AP = {mean_ap_ext_boot:.3f})')
-ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AP = {ext_ap:.3f})')
-ax.axhline(y=prevalence_ext, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_ext:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'D', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+    for ds in series:
+        y = np.asarray(ds['y'], dtype=int)
+        p = np.asarray(ds['prob'], dtype=float)
+        try:
+            nb_mean, nb_lo, nb_hi = bootstrap_net_benefit(
+                y, p, threshs, n_bootstrap=n_bootstrap)
+        except Exception as e:
+            print(f"    ⚠️ {ds['label']} Bootstrap 失败: {e}，改用点估计")
+            nb_mean = np.array([calculate_net_benefit(y, p, t) for t in threshs])
+            nb_lo = nb_hi = nb_mean.copy()
 
-plt.tight_layout()
-plt.savefig('figures/ROC_PR_Panel_Overview_D.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_PR_Panel_Overview_D.pdf', bbox_inches='tight')
-print("  ✓ 方案 D: figures/ROC_PR_Panel_Overview_D.png / .pdf")
-plt.close()
+        ax_main.plot(threshs, nb_mean, color=ds['color'], lw=1.5,
+                     alpha=0.9, label=ds['label'])
+        ax_main.fill_between(threshs, nb_lo, nb_hi, color=ds['color'], alpha=0.15)
 
+        n_high = [calculate_n_high_risk(p, t, len(y)) for t in threshs]
+        ax_num.plot(threshs, n_high, color=ds['color'], lw=1.5, alpha=0.8)
 
-# ==============================================================
-# 图10-B：2×2 面板 
-# ==============================================================
-print("绘制 2×2 面板（方案 B：Apparent + Harrell mean，直观展示 optimism）...")
+        y_max_candidates.append(nb_mean[threshs <= xmax].max())
 
-fig, axes = plt.subplots(2, 2, figsize=FIG_PANEL)
+        # 锁定阈值处的净获益，写入汇总表
+        nb_at_lock = (calculate_net_benefit(y, p, locked_threshold)
+                      if locked_threshold is not None else np.nan)
+        _SUPP_STATS_ROWS.append({
+            'Figure': record_tag or os.path.basename(save_path),
+            'Series': ds['label'], 'N': len(y), 'Events': int(y.sum()),
+            'Event_rate': y.mean(), 'Net_benefit_at_locked_threshold': nb_at_lock,
+            'Locked_threshold': locked_threshold,
+        })
 
-# --- (0,0) ROC Internal ---
-ax = axes[0, 0]
-ax.fill_between(mean_fpr, lower_tpr_int, upper_tpr_int, color=C_INT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_int, color=C_INT, lw=1.5,
-        label=f'Corrected (AUC = {mean_auc_int_boot:.3f})')
-ax.plot(fpr_apparent, tpr_apparent, color=C_APPARENT, lw=1.2, ls='--',
-        label=f'Apparent (AUC = {apparent_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'A', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+    ax_main.plot(threshs, all_nb, color='#999999', ls='--', lw=1.0, alpha=0.7,
+                 label=f'Treat all ({prevalence:.1%})')
+    ax_main.axhline(y=0, color='black', lw=0.8, ls='-.', alpha=0.7, label='Treat none')
+    if locked_threshold is not None:
+        ax_main.axvline(locked_threshold, color='#333333', ls='--', lw=1.2, alpha=0.9,
+                        label=f'Locked threshold = {locked_threshold:.3f}')
 
-# --- (0,1) ROC External ---
-ax = axes[0, 1]
-ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AUC = {mean_auc_ext:.3f})')
-ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AUC = {ext_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'B', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+    ax_main.set_xlim([0, xmax])
+    ax_main.set_ylim([-0.05, max(y_max_candidates) + 0.05])
+    ax_main.set_ylabel('Net benefit')
+    ax_main.tick_params(axis='x', labelbottom=False)
+    ax_main.spines['top'].set_visible(False)
+    ax_main.spines['right'].set_visible(False)
+    sci_legend(ax_main, loc='upper right', fontsize=6.5,
+               handlelength=1.8, handletextpad=0.5, labelspacing=0.35, borderpad=0.4)
 
-# --- (1,0) PR Internal ---
-ax = axes[1, 0]
-ax.fill_between(mean_recall, lower_prec_int, upper_prec_int, color=C_INT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_int, color=C_INT, lw=1.5,
-        label=f'Corrected (AP = {corrected_ap:.3f})')
-ax.plot(rec_apparent, prec_apparent, color=C_APPARENT, lw=1.2, ls='--',
-        label=f'Apparent (AP = {apparent_ap:.3f})')
-ax.axhline(y=prevalence_int, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_int:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'C', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+    ax_num.set_ylabel('Predicted risk ≥\nthreshold per 1000', fontsize=7)
+    ax_num.set_xlabel('Threshold probability')
+    ax_num.set_ylim([0, 1000])
+    ax_num.spines['top'].set_visible(False)
+    ax_num.spines['right'].set_visible(False)
 
-# --- (1,1) PR External ---
-ax = axes[1, 1]
-ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AP = {mean_ap_ext_boot:.3f})')
-ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AP = {ext_ap:.3f})')
-ax.axhline(y=prevalence_ext, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_ext:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'D', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
-
-plt.tight_layout()
-plt.savefig('figures/ROC_PR_Panel_Overview_B.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_PR_Panel_Overview_B.pdf', bbox_inches='tight')
-print("  ✓ 方案 B: figures/ROC_PR_Panel_Overview_B.png / .pdf")
-plt.close()
+    plt.tight_layout()
+    _supp_save(save_path)
+    return fig
 
 
-# ==============================================================
-# 图10-Full：2×2 面板
-# ==============================================================
-print("绘制 2×2 面板（完整版：Apparent + Corrected + OOF resample）...")
+def plot_agreement_scatter(prob_x, prob_y, y_true, xlabel, ylabel,
+                           save_path, threshold=None, figsize=(3.5, 3.5),
+                           record_tag=None):
+    """
+    两模型预测概率一致性散点 —— 事件/非事件分色，附 Pearson / Spearman / κ。
+    """
+    from scipy.stats import pearsonr, spearmanr
+    from sklearn.metrics import cohen_kappa_score
 
-fig, axes = plt.subplots(2, 2, figsize=FIG_PANEL)
+    px = np.asarray(prob_x, dtype=float)
+    py = np.asarray(prob_y, dtype=float)
+    yt = np.asarray(y_true, dtype=int)
 
-# --- (0,0) ROC Internal ---
-ax = axes[0, 0]
-ax.fill_between(mean_fpr, lower_tpr_int, upper_tpr_int, color=C_INT, alpha=0.12)
-ax.plot(mean_fpr, mean_tpr_int, color=C_INT, lw=1.5,
-        label=f'Corrected (AUC = {mean_auc_int_boot:.3f})')
-ax.plot(fpr_apparent, tpr_apparent, color=C_APPARENT, lw=1.0, ls=':',
-        label=f'Apparent (AUC = {apparent_auc:.3f})')
-ax.plot(mean_fpr, mean_tpr_oof_smooth, color=C_OOF_LINE, lw=1.0, ls='--',
-        label=f'OOF (AUC = {mean_auc_oof_boot:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'A', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+    r_p, _ = pearsonr(px, py)
+    r_s, _ = spearmanr(px, py)
+    if threshold is not None:
+        kappa = cohen_kappa_score((px >= threshold).astype(int),
+                                  (py >= threshold).astype(int))
+        agree = float(np.mean((px >= threshold) == (py >= threshold)))
+    else:
+        kappa, agree = np.nan, np.nan
 
-# --- (0,1) ROC External ---
-ax = axes[0, 1]
-ax.fill_between(mean_fpr, lower_tpr_ext, upper_tpr_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_fpr, mean_tpr_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AUC = {mean_auc_ext:.3f})')
-ax.plot(fpr_ext_orig, tpr_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AUC = {ext_auc:.3f})')
-ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--')
-ax.set_xlabel('1 − Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
-ax.set_aspect('equal')
-ax.text(-0.15, 1.05, 'B', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='lower right')
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--', zorder=1)
 
-# --- (1,0) PR Internal ---
-ax = axes[1, 0]
-ax.fill_between(mean_recall, lower_prec_int, upper_prec_int, color=C_INT, alpha=0.12)
-ax.plot(mean_recall, mean_prec_int, color=C_INT, lw=1.5,
-        label=f'Corrected (AP = {corrected_ap:.3f})')
-ax.plot(rec_apparent, prec_apparent, color=C_APPARENT, lw=1.0, ls=':',
-        label=f'Apparent (AP = {apparent_ap:.3f})')
-ax.plot(mean_recall, mean_prec_oof_smooth, color=C_OOF_LINE, lw=1.0, ls='--',
-        label=f'OOF (AP = {mean_ap_oof_boot:.3f})')
-ax.axhline(y=prevalence_int, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_int:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'C', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+    ax.scatter(px[yt == 0], py[yt == 0], s=10, marker='o',
+               facecolors='none', edgecolors='#9E9E9E', linewidths=0.5,
+               alpha=0.6, zorder=2, label='Non-events')
+    ax.scatter(px[yt == 1], py[yt == 1], s=14, marker='o',
+               facecolors=C_EXT, edgecolors='white', linewidths=0.4,
+               alpha=0.85, zorder=3, label='Events')
 
-# --- (1,1) PR External ---
-ax = axes[1, 1]
-ax.fill_between(mean_recall, lower_prec_ext, upper_prec_ext, color=C_EXT, alpha=0.15)
-ax.plot(mean_recall, mean_prec_ext, color=C_EXT, lw=1.5,
-        label=f'Bootstrap mean (AP = {mean_ap_ext_boot:.3f})')
-ax.plot(rec_ext_orig, prec_ext_orig, color=C_EXT_LINE, lw=1.2, ls='--',
-        label=f'Original (AP = {ext_ap:.3f})')
-ax.axhline(y=prevalence_ext, color='#999999', ls=':', lw=0.8,
-           label=f'Prevalence = {prevalence_ext:.3f}')
-ax.set_xlabel('Recall')
-ax.set_ylabel('Precision')
-ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
-ax.text(-0.15, 1.05, 'D', transform=ax.transAxes, fontweight='bold', fontsize=12)
-sci_legend(ax, loc='upper right')
+    if threshold is not None:
+        ax.axvline(threshold, color='#333333', ls=':', lw=0.8, alpha=0.7, zorder=1)
+        ax.axhline(threshold, color='#333333', ls=':', lw=0.8, alpha=0.7, zorder=1)
 
-plt.tight_layout()
-plt.savefig('figures/ROC_PR_Panel_Overview_Full.png', dpi=600, bbox_inches='tight')
-plt.savefig('figures/ROC_PR_Panel_Overview_Full.pdf', bbox_inches='tight')
-print("  ✓ 完整版: figures/ROC_PR_Panel_Overview_Full.png / .pdf")
-plt.close()
+    stats_txt = (f"Pearson r = {r_p:.3f}\nSpearman ρ = {r_s:.3f}"
+                 + (f"\nCohen κ = {kappa:.3f}\nAgreement = {agree:.1%}"
+                    if threshold is not None else ""))
+    ax.text(0.04, 0.96, stats_txt, transform=ax.transAxes, fontsize=6.5,
+            va='top', ha='left', color='#333333',
+            bbox=dict(boxstyle='square,pad=0.35', facecolor='white',
+                      edgecolor='#999999', linewidth=0.6))
 
-print("\n  ✅ 三个方案面板均已生成，请对比选择：")
-print("    • _D.png    → Harrell mean + OOF resample mean（推荐，两条都平滑）")
-print("    • _B.png    → Apparent + Harrell mean（直观展示 optimism 差距）")
-print("    • _Full.png → 三条线完整版（信息最丰富，适合补充材料）")
-
-# ------------------------------------------
-# 4. 校准曲线置信带（基于 Bootstrap）— 校准后版本
-# ------------------------------------------
-print("\n[额外-4] 绘制校准曲线置信带（校准后 + 前后对比）...")
-
-# 计算所有 Bootstrap 的校准曲线
-n_bins = 10
-calib_curves = []
-
-for boot_pred in bootstrap_predictions[:100]:  # 使用前100个以加快速度
-    y_true_boot = boot_pred['true_labels']
-    y_pred_boot = boot_pred['pred_probs']
-    
-    fraction_of_positives, mean_predicted_value = calibration_curve(
-        y_true_boot, y_pred_boot, n_bins=n_bins, strategy='quantile'
-    )
-    calib_curves.append((mean_predicted_value, fraction_of_positives))
-
-# 插值到统一网格
-pred_grid = np.linspace(0, 1, 100)
-interp_fractions = []
-
-for mean_pred, frac_pos in calib_curves:
-    if len(mean_pred) > 1:
-        f = interpolate.interp1d(mean_pred, frac_pos, kind='linear', 
-                                bounds_error=False, fill_value='extrapolate')
-        interp_fractions.append(f(pred_grid))
-
-# --- 图4a: 校准后版本 ---
-fig, ax = plt.subplots(figsize=(10, 10))
-
-if interp_fractions:
-    interp_fractions_arr = np.array(interp_fractions)
-    mean_frac = np.nanmean(interp_fractions_arr, axis=0)
-    std_frac = np.nanstd(interp_fractions_arr, axis=0)
-    
-    upper = np.minimum(mean_frac + 1.96 * std_frac, 1)
-    lower = np.maximum(mean_frac - 1.96 * std_frac, 0)
-    
-    ax.fill_between(pred_grid, lower, upper, color=COLOR_EXTERNAL, 
-                    alpha=0.2, label='95% CI')
-    ax.plot(pred_grid, mean_frac, color=COLOR_EXTERNAL, linewidth=2.5,
-            label='Mean calibration')
-
-# 校准后外部验证校准曲线
-fraction_of_positives_cal, mean_predicted_value_cal = calibration_curve(
-    y_ext, prob_ext_cal, n_bins=n_bins, strategy='quantile'
-)
-ax.plot(mean_predicted_value_cal, fraction_of_positives_cal, 'o-', 
-        color='darkblue', linewidth=2, markersize=8,
-        label='External (calibrated)')
-
-ax.plot([0, 1], [0, 1], 'k:', linewidth=2, label='Ideal')
-
-ax.set_xlabel('Predicted probability')
-ax.set_ylabel('Observed proportion')
-ax.set_title('Calibration (calibrated)', 
-            fontsize=13, pad=15)
-ax.legend(loc='upper left')
-ax.grid(alpha=0.15, linewidth=0.5)
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.02])
-
-plt.tight_layout()
-plt.savefig('figures/Calibration_Confidence_Band_Calibrated.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/Calibration_Confidence_Band_Calibrated.png")
-plt.close()
-
-# --- 图4b: 校准前后对比版本 ---
-fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-
-for ax_idx, (prob_ver, title_label) in enumerate([
-    (prob_ext, 'Before Calibration (Original)'),
-    (prob_ext_cal, 'After calibration')
-]):
-    ax = axes[ax_idx]
-    
-    if interp_fractions:
-        ax.fill_between(pred_grid, lower, upper, color=COLOR_EXTERNAL, 
-                        alpha=0.2, label='95% CI')
-        ax.plot(pred_grid, mean_frac, color=COLOR_EXTERNAL, linewidth=2.5,
-                label='Mean calibration')
-    
-    frac_pos_ver, mean_pred_ver = calibration_curve(
-        y_ext, prob_ver, n_bins=n_bins, strategy='quantile'
-    )
-    ax.plot(mean_pred_ver, frac_pos_ver, 'o-', 
-            color='darkred' if ax_idx == 0 else 'darkblue', linewidth=2, markersize=8,
-            label=f'External Calibration')
-    
-    ax.plot([0, 1], [0, 1], 'k:', linewidth=2, label='Ideal')
-    
-    ax.set_xlabel('Predicted probability')
-    ax.set_ylabel('Observed proportion')
-    ax.set_title(title_label, pad=10)
-    ax.legend(loc='upper left', fontsize=10)
-    ax.grid(alpha=0.15, linewidth=0.5)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.set_xlim([-0.02, 1.02])
     ax.set_ylim([-0.02, 1.02])
     ax.set_aspect('equal')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    sci_legend(ax, loc='lower right', fontsize=6.5)
 
-plt.suptitle('Calibration: before vs. after')
-plt.tight_layout()
-plt.savefig('figures/Calibration_Confidence_Band_BeforeAfter.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/Calibration_Confidence_Band_BeforeAfter.png")
-plt.close()
+    _SUPP_STATS_ROWS.append({
+        'Figure': record_tag or os.path.basename(save_path),
+        'Series': f'{xlabel} vs {ylabel}', 'N': len(yt), 'Events': int(yt.sum()),
+        'Pearson_r': r_p, 'Spearman_rho': r_s, 'Cohen_kappa': kappa,
+        'Classification_agreement': agree, 'Locked_threshold': threshold,
+    })
+
+    plt.tight_layout()
+    _supp_save(save_path)
+    return fig
 
 
-# ------------------------------------------
-# 5. 阈值-性能曲线（Threshold Performance Curve）
-# ------------------------------------------
-print("\n[额外-5] 绘制阈值-性能曲线...")
+def plot_risk_stratification_bars(series, save_path, n_groups=5,
+                                  figsize=(4.2, 3.2), record_tag=None):
+    """
+    五分位风险分层：各层「观察发生率（Wilson 95% CI）」vs「平均预测风险」。
+    series : list of dict(y=…, prob=…, label=…, color=…)
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    n_series = len(series)
+    width = 0.8 / max(n_series, 1)
 
-thresholds = np.linspace(0, 1, 100)
-metrics_at_thresh = {
-    'Sensitivity': [],
-    'Specificity': [],
-    'PPV': [],
-    'NPV': [],
-    'F1_Score': [],
-    'Accuracy': []
+    for k, ds in enumerate(series):
+        y = np.asarray(ds['y'], dtype=int)
+        p = np.asarray(ds['prob'], dtype=float)
+        cuts = np.unique(np.percentile(p, np.linspace(0, 100, n_groups + 1)[1:-1]))
+        grp = np.digitize(p, cuts)
+
+        obs, lo_err, hi_err, pred, xs = [], [], [], [], []
+        for g in range(n_groups):
+            m = grp == g
+            if m.sum() == 0:
+                continue
+            ev, n = int(y[m].sum()), int(m.sum())
+            lo, hi = _wilson_ci(ev, n)
+            obs.append(ev / n)
+            lo_err.append(ev / n - lo)
+            hi_err.append(hi - ev / n)
+            pred.append(p[m].mean())
+            xs.append(g)
+
+            _SUPP_STATS_ROWS.append({
+                'Figure': record_tag or os.path.basename(save_path),
+                'Series': ds['label'], 'Risk_group': g + 1, 'N': n, 'Events': ev,
+                'Observed_risk': ev / n, 'Mean_predicted_risk': p[m].mean(),
+                'CI_low': lo, 'CI_high': hi,
+            })
+
+        xs = np.asarray(xs, dtype=float) + (k - (n_series - 1) / 2) * width
+        ax.bar(xs, obs, width=width * 0.85, color=ds['color'], alpha=0.65,
+               edgecolor=ds['color'], linewidth=0.6,
+               label=f"{ds['label']} — observed")
+        ax.errorbar(xs, obs, yerr=[lo_err, hi_err], fmt='none', ecolor='#444444',
+                    elinewidth=0.6, capsize=1.8, capthick=0.6, zorder=4)
+        ax.plot(xs, pred, marker='D', ms=3.5, ls='none',
+                markerfacecolor='white', markeredgecolor=ds['color'],
+                markeredgewidth=0.9, zorder=5,
+                label=f"{ds['label']} — predicted")
+
+    ax.set_xticks(np.arange(n_groups))
+    ax.set_xticklabels([f'Q{i+1}' for i in range(n_groups)])
+    ax.set_xlabel('Predicted-risk quintile')
+    ax.set_ylabel('Event rate')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', alpha=0.15, linewidth=0.5)
+    ax.set_axisbelow(True)
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.32)        # 顶部留白给图例
+    sci_legend(ax, loc='upper left', fontsize=6.5,
+               ncol=2 if n_series > 1 else 1, columnspacing=1.0)
+
+    plt.tight_layout()
+    _supp_save(save_path)
+    return fig
+
+
+def plot_forest_metrics(df, save_path, metrics=None, figsize=(4.6, 4.2),
+                        title_note=None, record_tag=None):
+    """
+    指标森林图：每行一个指标，同一行内并排展示各模型的点估计 + 95% CI。
+    df 需含列 Model 及 <metric> / <metric>_CI_lo / <metric>_CI_hi
+    """
+    metrics = metrics or ['AUROC', 'AP', 'Brier', 'OE',
+                          'Sensitivity', 'Specificity', 'PPV', 'NPV']
+    metrics = [m for m in metrics if m in df.columns]
+    models  = list(df['Model'].unique())
+    style   = model_style(models)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    n_m = len(models)
+    offs = np.linspace(0.22, -0.22, n_m) if n_m > 1 else np.array([0.0])
+
+    for mi, mname in enumerate(models):
+        row = df[df['Model'] == mname].iloc[0]
+        col = style[mname]['color']
+        ys, xs, lo_e, hi_e = [], [], [], []
+        for j, met in enumerate(metrics):
+            v = row.get(met, np.nan)
+            if pd.isna(v):
+                continue
+            lo = row.get(f'{met}_CI_lo', np.nan)
+            hi = row.get(f'{met}_CI_hi', np.nan)
+            ys.append(len(metrics) - 1 - j + offs[mi])
+            xs.append(float(v))
+            lo_e.append(float(v) - float(lo) if not pd.isna(lo) else 0.0)
+            hi_e.append(float(hi) - float(v) if not pd.isna(hi) else 0.0)
+
+        ax.errorbar(xs, ys, xerr=[lo_e, hi_e], fmt=style[mname]['marker'],
+                    ms=4, color=col, ecolor=col, elinewidth=0.9,
+                    capsize=2, capthick=0.7, lw=0, alpha=0.9,
+                    label=model_label(mname))
+
+        for x, yy in zip(xs, ys):
+            ax.text(x, yy + 0.16, f'{x:.3f}', ha='center', va='bottom',
+                    fontsize=6, color='#555555')
+
+    ax.set_yticks(np.arange(len(metrics))[::-1])
+    ax.set_yticklabels(metrics)
+    ax.set_xlabel('Estimate (95% CI)')
+
+    # 自适应横轴：按实际取值范围留白，避免大片空白压缩可读性
+    lo_all, hi_all = [], []
+    for met in metrics:
+        for _, r in df.iterrows():
+            v = r.get(met, np.nan)
+            if pd.isna(v):
+                continue
+            lo_all.append(min(float(v), float(r.get(f'{met}_CI_lo', v))
+                              if not pd.isna(r.get(f'{met}_CI_lo', np.nan)) else float(v)))
+            hi_all.append(max(float(v), float(r.get(f'{met}_CI_hi', v))
+                              if not pd.isna(r.get(f'{met}_CI_hi', np.nan)) else float(v)))
+    if lo_all:
+        pad = max(0.05, (max(hi_all) - min(lo_all)) * 0.12)
+        ax.set_xlim(max(-0.02, min(lo_all) - pad), min(1.08, max(hi_all) + pad))
+    else:
+        ax.set_xlim(-0.02, 1.05)
+    ax.set_ylim(-1.15, len(metrics) - 0.45)        # 底部留一行空间给图例
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='x', alpha=0.15, linewidth=0.5)
+    ax.set_axisbelow(True)
+    if title_note:
+        ax.text(0.0, 1.02, title_note, transform=ax.transAxes, fontsize=7,
+                color='#555555', va='bottom', ha='left')
+    sci_legend(ax, loc='lower right', fontsize=6.5)
+
+    plt.tight_layout()
+    _supp_save(save_path)
+    return fig
+
+
+# ==========================================================================================
+# 9.2 数据装载：逐样本预测概率（只读盘，不重拟合）
+# ==========================================================================================
+def load_supp_model_probs(model_names=SUPP_MODELS):
+    """
+    返回 (probs, y_int_s, y_ext_s)
+      probs = {model: {'oof': ndarray, 'ext': ndarray, 'threshold': float}}
+
+    优先级：
+      1) HeadToHead_Probs_*.pkl                       ← 建模脚本 3.5 节直接导出
+      2) Model_Package 的 cv_results[m]['prob_oof']
+         + all_trained_models[m].predict_proba(X_external)
+    """
+    # ---- 路径 1：Head-to-Head 概率包 ----
+    h2h_path = _find_latest(f"{DATA_PATH}/HeadToHead_Probs_*.pkl")
+    if h2h_path:
+        try:
+            h2h = joblib.load(h2h_path)
+            y_i = np.asarray(h2h['y_internal'], dtype=int)
+            y_e = np.asarray(h2h['y_external'], dtype=int)
+            probs = {}
+            for m in model_names:
+                if f'{m}_oof_probs' in h2h and f'{m}_ext_probs' in h2h:
+                    oof = np.asarray(h2h[f'{m}_oof_probs'], dtype=float)
+                    ext = np.asarray(h2h[f'{m}_ext_probs'], dtype=float)
+                    probs[m] = {'oof': oof, 'ext': ext,
+                                'threshold': _youden_threshold(y_i, oof)}
+            if len(probs) >= 1:
+                print(f"  ✓ 概率来源: {os.path.basename(h2h_path)} "
+                      f"（{', '.join(probs)}）")
+                return probs, y_i, y_e
+        except Exception as e:
+            print(f"  ⚠️ 读取 HeadToHead_Probs 失败（{e}），改用模型包回退方案")
+
+    # ---- 路径 2：模型包回退 ----
+    cvres  = full_package.get('cv_results', {}) or {}
+    models = full_package.get('all_trained_models', {}) or {}
+    if X_EXT_RAW is None or Y_TRAIN is None:
+        raise FileNotFoundError("模型包缺少原始特征表/标签，无法回退计算 S1–S3 概率")
+
+    y_i = np.asarray(Y_TRAIN, dtype=int)
+    y_e = np.asarray(Y_EXT_PKG if Y_EXT_PKG is not None else y_ext, dtype=int)
+
+    probs = {}
+    for m in model_names:
+        if m not in cvres or 'prob_oof' not in cvres[m] or m not in models:
+            print(f"  ⚠️ 模型包中缺少 {m} 的 OOF 概率或已训练管道，跳过")
+            continue
+        oof = np.asarray(cvres[m]['prob_oof'], dtype=float)
+        ext = models[m].predict_proba(X_EXT_RAW)[:, 1]
+        probs[m] = {'oof': oof, 'ext': ext,
+                    'threshold': _youden_threshold(y_i, oof)}
+    print(f"  ✓ 概率来源: Model_Package（{', '.join(probs) if probs else '无'}）")
+    return probs, y_i, y_e
+
+
+# ==========================================================================================
+# 9.3 S1 — Logistic regression vs XGBoost 并列比较
+# ==========================================================================================
+def run_supp_S1(probs, y_i, y_e):
+    print("\n[S1] Logistic regression vs XGBoost 并列比较 ...")
+    names = [m for m in SUPP_MODELS if m in probs]
+    if len(names) < 1:
+        print("  ⚠️ 无可用模型，跳过 S1")
+        return
+    style = model_style(names)
+    lock  = probs[names[0]]['threshold']
+
+    for tag, key, y_arr, cohort in [('Internal', 'oof', y_i, 'Internal validation (OOF)'),
+                                    ('External', 'ext', y_e, 'External validation')]:
+        series = [{'y': y_arr, 'prob': probs[m][key], 'label': model_label(m),
+                   'color': style[m]['color'], 'marker': style[m]['marker']}
+                  for m in names]
+
+        # --- 校准曲线 ---
+        print(f"  · S1 校准曲线 — {cohort}")
+        plot_calibration_multi(
+            series, f'{SUPP_DIR}/S1_Calibration_{tag}.png',
+            note=f'{cohort}\nN = {len(y_arr)}, events = {int(np.sum(y_arr))}',
+            record_tag=f'S1_Calibration_{tag}')
+
+        # --- 决策曲线 ---
+        print(f"  · S1 决策曲线 — {cohort}")
+        plot_dca_multi(
+            [{k: v for k, v in s.items() if k != 'marker'} for s in series],
+            f'{SUPP_DIR}/S1_DCA_{tag}.png',
+            locked_threshold=lock, record_tag=f'S1_DCA_{tag}')
+
+    # --- 一致性散点（需要恰好两个模型）---
+    if len(names) >= 2:
+        m1, m2 = names[0], names[1]
+        for tag, key, y_arr in [('Internal', 'oof', y_i), ('External', 'ext', y_e)]:
+            print(f"  · S1 一致性散点 — {tag}")
+            plot_agreement_scatter(
+                probs[m1][key], probs[m2][key], y_arr,
+                xlabel=f'{model_label(m1)} predicted probability',
+                ylabel=f'{model_label(m2)} predicted probability',
+                save_path=f'{SUPP_DIR}/S1_Agreement_{tag}.png',
+                threshold=probs[m1]['threshold'],
+                record_tag=f'S1_Agreement_{tag}')
+
+
+# ==========================================================================================
+# 9.4 S2 — 外部验证校准汇总
+# ==========================================================================================
+def run_supp_S2(probs, y_e):
+    print("\n[S2] 外部验证校准汇总 ...")
+    names = [m for m in SUPP_MODELS if m in probs]
+    if not names:
+        print("  ⚠️ 无可用模型，跳过 S2")
+        return
+    style = model_style(names)
+
+    series = [{'y': y_e, 'prob': probs[m]['ext'], 'label': model_label(m),
+               'color': style[m]['color'], 'marker': style[m]['marker']}
+              for m in names]
+
+    print("  · S2 外部校准曲线（含 bootstrap 95% 带）")
+    plot_calibration_multi(
+        series, f'{SUPP_DIR}/S2_External_Calibration.png',
+        n_bootstrap=max(SUPP_N_BOOT_CAL, 1000),
+        note=f'External validation\nN = {len(y_e)}, events = {int(np.sum(y_e))}',
+        record_tag='S2_External_Calibration')
+
+    print("  · S2 五分位风险分层（观察 vs 预测）")
+    plot_risk_stratification_bars(
+        series, f'{SUPP_DIR}/S2_External_RiskStratification.png',
+        n_groups=5, record_tag='S2_External_RiskStratification')
+
+
+# ==========================================================================================
+# 9.5 S3 — 完整病例敏感性分析（外部队列）
+# ==========================================================================================
+def run_supp_S3(probs):
+    print("\n[S3] 完整病例敏感性分析（外部队列）...")
+
+    models = full_package.get('all_trained_models', {}) or {}
+    fnames = full_package.get('feature_names', {}) or {}
+    all_features = (list(fnames.get('log', [])) + list(fnames.get('numeric', []))
+                    + list(fnames.get('categorical', [])))
+
+    if X_EXT_RAW is None or not all_features or not models:
+        print("  ⚠️ 模型包缺少原始外部特征表 / 特征清单 / 已训练管道，跳过 S3")
+        return
+
+    feats = [f for f in all_features if f in X_EXT_RAW.columns]
+    complete_mask = X_EXT_RAW[feats].notnull().all(axis=1)
+    y_e_pkg = np.asarray(Y_EXT_PKG if Y_EXT_PKG is not None else y_ext, dtype=int)
+
+    X_cc = X_EXT_RAW.loc[complete_mask]
+    y_cc = y_e_pkg[np.asarray(complete_mask)]
+
+    n_total, n_cc = len(X_EXT_RAW), int(complete_mask.sum())
+    print(f"  外部队列: {n_total} 例 | 完整病例: {n_cc} ({n_cc/n_total:.1%}) | "
+          f"含缺失: {n_total-n_cc} ({1-n_cc/n_total:.1%})")
+    print(f"  完整病例事件数: {int(y_cc.sum())} ({y_cc.mean():.1%})")
+    print("  ⚠️ 完整病例分析仅为敏感性分析；若缺失非完全随机，删除缺失病例可能引入选择偏倚")
+
+    names = [m for m in SUPP_MODELS if m in models and m in probs]
+    if not names or len(y_cc) < 20 or len(np.unique(y_cc)) < 2:
+        print("  ⚠️ 完整病例样本不足或模型缺失，跳过 S3")
+        return
+    style = model_style(names)
+
+    series = []
+    for m in names:
+        p_cc = models[m].predict_proba(X_cc)[:, 1]
+        series.append({'y': y_cc, 'prob': p_cc, 'label': model_label(m),
+                       'color': style[m]['color'], 'marker': style[m]['marker']})
+
+    note = (f'External complete cases\nN = {n_cc}/{n_total} ({n_cc/n_total:.0%}), '
+            f'events = {int(y_cc.sum())}')
+
+    print("  · S3 校准曲线")
+    plot_calibration_multi(series, f'{SUPP_DIR}/S3_CompleteCases_Calibration.png',
+                           note=note, record_tag='S3_CompleteCases_Calibration')
+
+    print("  · S3 决策曲线")
+    plot_dca_multi([{k: v for k, v in s.items() if k != 'marker'} for s in series],
+                   f'{SUPP_DIR}/S3_CompleteCases_DCA.png',
+                   locked_threshold=probs[names[0]]['threshold'],
+                   record_tag='S3_CompleteCases_DCA')
+
+
+# ==========================================================================================
+# 9.6 S4 — 5 变量 vs 10 变量 XGBoost 敏感性分析
+# ==========================================================================================
+def _load_s4_probs():
+    """兼容嵌套 dict 与扁平键两种导出格式；找不到返回 None"""
+    path = _find_latest(f"{DATA_PATH}/S4_Sensitivity_Probs_*.pkl")
+    if not path:
+        return None
+    try:
+        pkg = joblib.load(path)
+    except Exception as e:
+        print(f"  ⚠️ 读取 {os.path.basename(path)} 失败: {e}")
+        return None
+
+    y_i = np.asarray(pkg['y_internal'], dtype=int)
+    y_e = np.asarray(pkg['y_external'], dtype=int)
+    probs = {}
+    for m in SUPP_S4_MODELS:
+        if isinstance(pkg.get(m), dict):
+            d = pkg[m]
+            probs[m] = {'oof': np.asarray(d['oof_probs'], dtype=float),
+                        'ext': np.asarray(d['ext_probs'], dtype=float),
+                        'threshold': float(d.get('threshold', np.nan))}
+        elif f'{m}_oof_probs' in pkg:
+            oof = np.asarray(pkg[f'{m}_oof_probs'], dtype=float)
+            probs[m] = {'oof': oof,
+                        'ext': np.asarray(pkg[f'{m}_ext_probs'], dtype=float),
+                        'threshold': _youden_threshold(y_i, oof)}
+    if not probs:
+        return None
+    print(f"  ✓ 概率来源: {os.path.basename(path)}")
+    return probs, y_i, y_e
+
+
+def run_supp_S4():
+    print("\n[S4] 5 变量 vs 10 变量 XGBoost 敏感性分析 ...")
+
+    # ---------- 路径 A：有逐样本概率包 → 校准 + DCA ----------
+    loaded = _load_s4_probs()
+    if loaded is not None:
+        probs, y_i, y_e = loaded
+        names = [m for m in SUPP_S4_MODELS if m in probs]
+        style = model_style(names)
+        lock  = probs[names[0]]['threshold']
+
+        for tag, key, y_arr, cohort in [
+                ('Internal', 'oof', y_i, 'Internal validation (OOF)'),
+                ('External', 'ext', y_e, 'External validation')]:
+            series = [{'y': y_arr, 'prob': probs[m][key], 'label': model_label(m),
+                       'color': style[m]['color'], 'marker': style[m]['marker']}
+                      for m in names]
+
+            print(f"  · S4 校准曲线 — {cohort}")
+            plot_calibration_multi(
+                series, f'{SUPP_DIR}/S4_Sensitivity_Calibration_{tag}.png',
+                note=f'{cohort}\nN = {len(y_arr)}, events = {int(np.sum(y_arr))}',
+                record_tag=f'S4_Sensitivity_Calibration_{tag}')
+
+            print(f"  · S4 决策曲线 — {cohort}")
+            plot_dca_multi(
+                [{k: v for k, v in s.items() if k != 'marker'} for s in series],
+                f'{SUPP_DIR}/S4_Sensitivity_DCA_{tag}.png',
+                locked_threshold=lock if np.isfinite(lock) else None,
+                record_tag=f'S4_Sensitivity_DCA_{tag}')
+    else:
+        print("  ℹ️ 未找到 S4_Sensitivity_Probs_*.pkl（10 变量模型未持久化）")
+        print("     → 仅绘制 S4E 森林图；如需校准/决策曲线，请按本节顶部注释在")
+        print("       comprehensive_analysis.py 的 section4 末尾补一行 joblib.dump")
+
+    # ---------- 路径 B：森林图（只需 comprehensive_analysis 的 CSV）----------
+    csv_path = _find_latest(f"{DATA_PATH}/S4_Sensitivity_5v10_AllMetrics_*.csv")
+    if not csv_path:
+        print("  ⚠️ 未找到 S4_Sensitivity_5v10_AllMetrics_*.csv，跳过森林图")
+        return
+    try:
+        sens_df = pd.read_csv(csv_path)
+        ext_df  = sens_df[sens_df['Dataset'] == 'External'].copy()
+        if ext_df.empty:
+            print("  ⚠️ CSV 中无 External 行，跳过森林图")
+            return
+        print(f"  · S4 外部指标森林图（数据: {os.path.basename(csv_path)}）")
+        plot_forest_metrics(
+            ext_df, f'{SUPP_DIR}/S4_Sensitivity_Forest_External.png',
+            title_note='External validation — point estimate (95% CI)',
+            record_tag='S4_Sensitivity_Forest_External')
+
+        # Δ 指标打印（与原脚本一致的结论口径）
+        try:
+            r5  = ext_df[ext_df['Model'] == 'XGB_5var_LASSO'].iloc[0]
+            r10 = ext_df[ext_df['Model'] == 'XGB_10var_Full'].iloc[0]
+            d_auc = r10['AUROC'] - r5['AUROC']
+            d_ap  = r10['AP'] - r5['AP']
+            print(f"    ΔAUROC = {d_auc:+.4f} | ΔAP = {d_ap:+.4f} | "
+                  f"ΔBrier = {r10['Brier'] - r5['Brier']:+.4f}")
+            print("    ✅ 全变量模型无明显改善 → 支持简约五变量模型"
+                  if (d_auc < 0.02 and d_ap < 0.02)
+                  else "    ⚠️ 全变量模型有潜在改善 → 建议重新审视变量筛选策略")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"  ⚠️ 森林图绘制失败: {e}")
+
+
+# ==========================================================================================
+# 9.7 补充图模块入口
+# ==========================================================================================
+def run_supplementary_S1_S4():
+    set_sci_style()                       # 确保不受 SHAP 局部样式影响
+    os.makedirs(SUPP_DIR, exist_ok=True)
+
+    try:
+        probs, y_i, y_e = load_supp_model_probs()
+    except Exception as e:
+        print(f"  ⚠️ 逐样本概率装载失败（{e}），S1–S3 跳过")
+        probs, y_i, y_e = {}, None, None
+
+    if probs:
+        try:
+            run_supp_S1(probs, y_i, y_e)
+        except Exception as e:
+            print(f"  ⚠️ S1 出错: {e}")
+        try:
+            run_supp_S2(probs, y_e)
+        except Exception as e:
+            print(f"  ⚠️ S2 出错: {e}")
+        try:
+            run_supp_S3(probs)
+        except Exception as e:
+            print(f"  ⚠️ S3 出错: {e}")
+
+    try:
+        run_supp_S4()
+    except Exception as e:
+        print(f"  ⚠️ S4 出错: {e}")
+
+    # ---- 汇总统计量 CSV（图中所有数字的溯源表）----
+    if _SUPP_STATS_ROWS:
+        try:
+            out_csv = f'{DATA_PATH}/Supp_S1S4_Plot_Stats_{TIMESTAMP}.csv'
+            pd.DataFrame(_SUPP_STATS_ROWS).to_csv(
+                out_csv, index=False, encoding='utf-8-sig')
+            print(f"\n  ✓ 补充图统计量汇总已导出: {out_csv}")
+        except Exception as e:
+            print(f"  ⚠️ 统计量汇总导出失败: {e}")
+
+
+if SUPP_ENABLE:
+    try:
+        run_supplementary_S1_S4()
+    except FileNotFoundError as e:
+        print(f"⚠️ 跳过补充图 S1–S4（缺少文件）: {e}")
+    except Exception as e:
+        print(f"⚠️ 补充图 S1–S4 模块出错: {e}")
+else:
+    print("ℹ️ SUPP_ENABLE = False，已跳过补充图 S1–S4。")
+
+
+
+
+# ==========================================================================================
+# 十、补充图 S5 —— 术中变量（手术时长 / PFCL / 联合白内障手术）的增量价值评估
+# ==========================================================================================
+
+print("\n" + "=" * 60)
+print("📐 生成补充图 S5 —— 术中变量增量价值（审稿意见专用）...")
+print("=" * 60)
+
+from sklearn.model_selection import RepeatedStratifiedKFold
+from scipy.stats import norm as _norm, chi2 as _chi2
+
+# ---------------- 可调参数 ----------------
+INCR_ENABLE      = True                 # 一键开关
+INCR_DIR         = 'figures'            # 图与表输出目录（与正文图同级）
+INCR_VARS        = ['Surgery_Duration', 'PFCL', 'Phacovitrectomy']   # 三个术中变量
+INCR_N_BOOT      = 1000                 # 配对 bootstrap 次数（Δ 指标 95% CI）
+INCR_CV_FOLDS    = 5                    # 开发队列重采样：折数（与主流程一致）
+INCR_CV_REPEATS  = 20                   # 开发队列重采样：重复次数（与主流程一致）
+INCR_SEED        = 42
+INCR_ROPE_AUROC  = 0.02                 # ΔAUROC 的「临床可忽略区间」(ROPE)，仅用于图上淡色带
+INCR_DCA_XMAX    = SUPP_DCA_XMAX        # 决策曲线横轴上限（与正文 F 一致）
+INCR_N_BOOT_CAL  = SUPP_N_BOOT_CAL      # 校准曲线 bootstrap 带
+INCR_N_BOOT_DCA  = SUPP_N_BOOT_DCA      # 决策曲线 bootstrap 带
+
+# ---------------- 结果收集器（最后统一导出 CSV）----------------
+_INCR_ROWS_SPEC     = []   # 分析设计说明（逐条对应审稿问题）
+_INCR_ROWS_METRICS  = []   # 各模型绝对指标 + 95% CI
+_INCR_ROWS_DELTAS   = []   # Δ 指标 + 95% CI + p（审稿问题 5 的核心表）
+_INCR_ROWS_COEF     = []   # 术中变量的调整后 OR + LRT
+_INCR_ROWS_RECLASS  = []   # cfNRI / 分类 NRI / IDI
+_INCR_ROWS_DCA      = []   # 全阈值净获益（决策曲线的数字底稿）
+
+# ---------------- 模型展示名（并入 MODEL_LABEL_MAP，供 model_label 复用）----------------
+MODEL_LABEL_MAP.update({
+    'Preop':            'Preoperative model',
+    'Preop_Intraop':    'Pre + intraoperative model',
+    'Base_LP':          'Preoperative model (anchored)',
+    'Add_Surgery_Duration': 'Preoperative + operative duration',
+    'Add_PFCL':             'Preoperative + PFCL',
+    'Add_Phacovitrectomy':  'Preoperative + phacovitrectomy',
+    'Add_All_Intraop':      'Preoperative + all 3 intraoperative',
+})
+
+# 术中变量的短标签（森林图 y 轴用，避免过长）
+INCR_SHORT_LABEL = {
+    'Base_LP':               'Preoperative model (reference)',
+    'Add_Surgery_Duration':  '+ Operative duration',
+    'Add_PFCL':              '+ PFCL',
+    'Add_Phacovitrectomy':   '+ Phacovitrectomy',
+    'Add_All_Intraop':       '+ All three (joint)',
+    'Preop_Intraop':         '+ All three (full re-training)',
 }
 
-for thresh in thresholds:
-    y_pred = (prob_ext_cal >= thresh).astype(int)
-    
-    tn = np.sum((y_ext == 0) & (y_pred == 0))
-    tp = np.sum((y_ext == 1) & (y_pred == 1))
-    fn = np.sum((y_ext == 1) & (y_pred == 0))
-    fp = np.sum((y_ext == 0) & (y_pred == 1))
-    
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-    acc = (tp + tn) / (tp + tn + fp + fn)
-    f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
-    
-    metrics_at_thresh['Sensitivity'].append(sens)
-    metrics_at_thresh['Specificity'].append(spec)
-    metrics_at_thresh['PPV'].append(ppv)
-    metrics_at_thresh['NPV'].append(npv)
-    metrics_at_thresh['F1_Score'].append(f1)
-    metrics_at_thresh['Accuracy'].append(acc)
+# 队列配色沿用正文语义：蓝 = 内部/开发，红 = 外部
+INCR_COHORT_COLOR = {'Development': C_INT, 'External': C_EXT}
+INCR_COHORT_MARK  = {'Development': 'o',   'External': 's'}
 
-fig, ax = plt.subplots(figsize=(12, 8))
-
-colors_thresh = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']
-for (metric, values), color in zip(metrics_at_thresh.items(), colors_thresh):
-    ax.plot(thresholds, values, linewidth=2.5, label=metric, color=color)
-
-# 标记校准后最优阈值
-ax.axvline(clinical_threshold_cal_ext, color='red', linestyle='--', linewidth=2,
-          label=f'Calibrated Threshold: {clinical_threshold_cal_ext:.4f}')
-
-ax.set_xlabel('Classification Threshold')
-ax.set_ylabel('Metric Value')
-ax.set_title('Performance Metrics vs Classification Threshold\nExternal Validation (calibrated)', 
-            fontsize=13, pad=15)
-ax.legend(loc='best', fontsize=11, ncol=2)
-ax.grid(alpha=0.15, linewidth=0.5)
-ax.set_xlim([0, 1])
-ax.set_ylim([0, 1.05])
-
-plt.tight_layout()
-plt.savefig('figures/Threshold_Performance_Curve.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/Threshold_Performance_Curve.png")
-plt.close()
+# 模型对比配色（同一队列内两条曲线）：深蓝 vs 青绿，与 S1–S4 口径一致
+INCR_MODEL_COLOR = {'base': COLORS_LIST[3], 'new': COLORS_LIST[2]}
 
 
-# ------------------------------------------
-# 6. 预测概率分布图（按真实标签分层）
-# ------------------------------------------
-print("\n[额外-6] 绘制预测概率分布图 (校准后)...")
-
-fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-
-datasets_prob = [
-    (y_int, prob_int_cal, 'Internal (calibrated)', COLOR_INTERNAL, clinical_threshold_cal_int),
-    (y_ext, prob_ext_cal, 'External (calibrated)', COLOR_EXTERNAL, clinical_threshold_cal_ext)
-]
-
-# 定义 SCI 高级配色
-col_non_rec = '#4A7BB7'  # 沉稳科研蓝
-col_rec = '#C44E52'      # 经典砖红色
-col_thresh = '#595959'   # 碳灰色（用于阈值线）
-
-for idx, (y_true, y_pred, title, color, thresh_cal) in enumerate(datasets_prob):
-    # ====================
-    # 1. 直方图 (Histogram)
-    # ====================
-    ax1 = axes[idx, 0]
-    
-    # 调整 alpha，将 edgecolor 改为 white，增加柱子层次感
-    ax1.hist(y_pred[y_true == 0], bins=30, alpha=0.75, color=col_non_rec, 
-             label='Non-recurrence', edgecolor='white', linewidth=0.8, density=True)
-    ax1.hist(y_pred[y_true == 1], bins=30, alpha=0.75, color=col_rec, 
-             label='Recurrence', edgecolor='white', linewidth=0.8, density=True)
-    
-    # 阈值线：使用校准后阈值
-    ax1.axvline(thresh_cal, color=col_thresh, linestyle='--', linewidth=1.5,
-               label=f'Threshold: {thresh_cal:.3f}')
-    
-    ax1.set_xlabel('Predicted probability')
-    ax1.set_ylabel('Density')
-    ax1.set_title(f'{title}\nProbability Distribution')
-    
-    # 图例去边框，网格线极度弱化
-    ax1.legend(frameon=True, edgecolor='#999999', fontsize=10)
-    ax1.grid(alpha=0.2, linestyle=':')
-    
-    # 顶刊必备：去掉右侧和顶部的边框线
-    ax1.spines['top'].set_visible(False)
-    ax1.spines['right'].set_visible(False)
-    
-    # ====================
-    # 2. 箱线图 (Boxplot)
-    # ====================
-    ax2 = axes[idx, 1]
-    
-    # 自定义 boxplot 的各个部件样式
-    boxprops = dict(linewidth=1.2, alpha=0.8)
-    medianprops = dict(linewidth=1.5, color='black') # 中位数线用纯黑，对比鲜明
-    whiskerprops = dict(linewidth=1.2, color='#333333')
-    capprops = dict(linewidth=1.2, color='#333333')
-    flierprops = dict(marker='o', markersize=4, alpha=0.4, markeredgecolor='none')
-
-    bp = ax2.boxplot([y_pred[y_true == 0], y_pred[y_true == 1]], 
-                     labels=['Non-recurrence', 'Recurrence'],
-                     patch_artist=True, widths=0.5,
-                     boxprops=boxprops, medianprops=medianprops,
-                     whiskerprops=whiskerprops, capprops=capprops,
-                     flierprops=flierprops)
-    
-    # 给箱子填充颜色
-    colors = [col_non_rec, col_rec]
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_edgecolor('#333333') # 箱体边框用深灰
-        
-    # 给异常值点 (fliers) 也配上对应的颜色
-    for flier, color in zip(bp['fliers'], colors):
-        flier.set_markerfacecolor(color)
-    
-    ax2.axhline(thresh_cal, color=col_thresh, linestyle='--', linewidth=1.5,
-               label=f'Threshold: {thresh_cal:.3f}')
-               
-    ax2.set_ylabel('Predicted probability')
-    ax2.set_title(f'{title}\nProbability by Outcome')
-    
-    ax2.legend(frameon=True, edgecolor='#999999', fontsize=10, loc='best')
-    ax2.grid(alpha=0.2, linestyle=':', axis='y')
-    
-    # 同样去掉多余边框
-    ax2.spines['top'].set_visible(False)
-    ax2.spines['right'].set_visible(False)
-
-plt.tight_layout()
-plt.savefig('figures/Prediction_Probability_Distribution.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/Prediction_Probability_Distribution.png")
-plt.close()
-
-
-
-# ------------------------------------------
-# 8. 学习曲线（Learning Curve）
-# ------------------------------------------
-print("\n[额外-8] 绘制学习曲线...")
-# 数据已在 Section 2.1 加载 (X_train, y_train, X_ext)
-from sklearn.model_selection import learning_curve
-train_sizes, train_scores, val_scores = learning_curve(
-    best_model, X_train, y_train,
-    cv=5, scoring='roc_auc',
-    train_sizes=np.linspace(0.1, 1.0, 10),
-    n_jobs=-1, random_state=42
-)
-
-train_mean = train_scores.mean(axis=1)
-train_std = train_scores.std(axis=1)
-val_mean = val_scores.mean(axis=1)
-val_std = val_scores.std(axis=1)
-
-fig, ax = plt.subplots(figsize=(10, 8))
-
-ax.plot(train_sizes, train_mean, 'o-', color=COLOR_INTERNAL, linewidth=2.5,
-        markersize=8, label='Training')
-ax.fill_between(train_sizes, train_mean - train_std, train_mean + train_std,
-                alpha=0.2, color=COLOR_INTERNAL)
-
-ax.plot(train_sizes, val_mean, 's-', color=COLOR_EXTERNAL, linewidth=2.5,
-        markersize=8, label='Validation (CV)')
-ax.fill_between(train_sizes, val_mean - val_std, val_mean + val_std,
-                alpha=0.2, color=COLOR_EXTERNAL)
-
-ax.set_xlabel('Training cohort size')
-ax.set_ylabel('AUC Score')
-ax.set_title(f'Learning Curve', pad=10)
-ax.legend(loc='lower right')
-ax.grid(alpha=0.15, linewidth=0.5)
-ax.set_ylim([0.6, 1.05])
-
-plt.tight_layout()
-plt.savefig('figures/Learning_Curve.png', dpi=DPI, bbox_inches='tight')
-print("  ✓ 已保存: figures/Learning_Curve.png")
-plt.close()
-
-
-# ------------------------------------------
-# 9. 特征相关性热图
-# ------------------------------------------
-print("\n[额外-9] 绘制特征相关性热图...")
-
-if 'importance_df' in locals():
-    top_features = importance_df['Feature'].head(10).tolist()
-    X_top_features = X_train_df[top_features]
-    
-    correlation_matrix = X_top_features.corr()
-    
-    fig, ax = plt.subplots(figsize=(8, 7))
-    
-    # 自定义 mask：只显示下三角（含对角线）
-    mask = np.triu(np.ones_like(correlation_matrix, dtype=bool), k=1)
-    
-    sns.heatmap(correlation_matrix, 
-                annot=True, fmt='.2f', 
-                annot_kws={'size': 13},
-                mask=mask,
-                cmap='RdBu_r', center=0, 
-                square=True, linewidths=1.5, linecolor='white',
-                cbar_kws={"shrink": 0.75, "label": "Pearson r"},
-                ax=ax, vmin=-1, vmax=1)
-    
-    ax.set_title('Feature Correlation', 
-                fontsize=14, pad=15)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-    
-    plt.tight_layout()
-    plt.savefig('figures/Feature_Correlation_Heatmap.png', dpi=DPI, bbox_inches='tight')
-    print("  ✓ 已保存: figures/Feature_Correlation_Heatmap.png")
-    plt.close()
-
-
-
-print(f"\n{'='*60}")
-print("✅ 所有额外可视化分析完成！")
-print(f"{'='*60}\n")
-
-
-# ============================================================================
-# 第三部分：Bootstrap 稳定性分析可视化
-# ============================================================================
-
-# (Using global SCI style set at top of script)
-
-# ------------------------------------------
-# 3.1 Bootstrap 稳定性分析 - 指标分布可视化
-# ------------------------------------------
-print("\n[可视化 1/6] 绘制 Bootstrap 指标分布图...")
-
-fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-fig.suptitle(f'Bootstrap Stability (n = 1,000)', 
-             fontsize=14, y=0.98)
-
-metrics_to_plot = ['AUC', 'Brier', 'AP', 'Sensitivity', 'Specificity', 'PPV', 'NPV', 'Balanced_Acc']
-
-# 如果没有 Balanced_Acc，添加它
-if 'Balanced_Acc' not in df_bootstrap_raw.columns:
-    df_bootstrap_raw['Balanced_Acc'] = (df_bootstrap_raw['Sensitivity'] + df_bootstrap_raw['Specificity']) / 2
-
-if 'Balanced_Acc' not in df_bootstrap_summary.index:
-    print("正在补全 Balanced_Acc 的统计信息...")
-    # 获取刚刚算出来的这一列数据
-    ba_data = df_bootstrap_raw['Balanced_Acc']
-    
-    # 计算统计量
-    ba_mean = ba_data.mean()
-    ba_lower = np.percentile(ba_data, 2.5)  # 2.5% 分位数
-    ba_upper = np.percentile(ba_data, 97.5) # 97.5% 分位数
-
-    df_bootstrap_summary.loc['Balanced_Acc', 'Mean'] = ba_mean
-    df_bootstrap_summary.loc['Balanced_Acc', '95%_CI_Lower'] = ba_lower
-    df_bootstrap_summary.loc['Balanced_Acc', '95%_CI_Upper'] = ba_upper
-for idx, metric in enumerate(metrics_to_plot):
-    ax = axes.flatten()[idx]
-    
-    # 绘制小提琴图
-    parts = ax.violinplot([df_bootstrap_raw[metric]], positions=[0], widths=0.7,
-                          showmeans=True, showmedians=True)
-    
-    # 自定义颜色
-    for pc in parts['bodies']:
-        pc.set_facecolor('#4ECDC4')
-        pc.set_alpha(0.7)
-    
-    # 添加散点（抖动显示）
-    y_jitter = df_bootstrap_raw[metric] + np.random.normal(0, 0.01, len(df_bootstrap_raw))
-    ax.scatter(np.zeros(len(df_bootstrap_raw)), y_jitter, 
-              alpha=0.3, s=10, c='gray', edgecolors='none')
-    
-    # 标注统计信息
-    mean_val = df_bootstrap_summary.loc[metric, 'Mean']
-    ci_lower = df_bootstrap_summary.loc[metric, '95%_CI_Lower']
-    ci_upper = df_bootstrap_summary.loc[metric, '95%_CI_Upper']
-    
-    ax.axhline(mean_val, color='red', linestyle='--', linewidth=1.5, alpha=0.8, label='Mean')
-    ax.axhspan(ci_lower, ci_upper, alpha=0.2, color='orange', label='95% CI')
-    
-    # 设置标题和标签
-    ax.set_title(f'{metric}\n{mean_val:.3f} ({ci_lower:.3f}-{ci_upper:.3f})', 
-                fontsize=10)
-    ax.set_ylabel('Value')
-    ax.set_xticks([])
-    ax.grid(axis='y', alpha=0.15, linewidth=0.5)
-    ax.legend(loc='upper right', fontsize=8)
-
-plt.tight_layout()
-plt.savefig('figures/Bootstrap_Metrics_Distribution.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: Bootstrap_Metrics_Distribution.png")
-plt.close()
-
-# ------------------------------------------
-# 3.2 Bootstrap ROC 曲线置信带
-# ------------------------------------------
-print("\n[可视化 2/6] 绘制 Bootstrap ROC 曲线置信带...")
-
-fig, ax = plt.subplots(figsize=(8, 8))
-
-# 计算每次 Bootstrap 的 ROC 曲线
-tprs = []
-aucs = []
-mean_fpr = np.linspace(0, 1, 100)
-
-for boot_pred in bootstrap_predictions:
-    y_true = boot_pred['true_labels']
-    y_score = boot_pred['pred_probs']
-    
-    fpr, tpr, _ = roc_curve(y_true, y_score)
-    roc_auc = auc(fpr, tpr)
-    
-    # 插值到统一的 FPR 网格
-    interp_tpr = np.interp(mean_fpr, fpr, tpr)
-    interp_tpr[0] = 0.0
-    tprs.append(interp_tpr)
-    aucs.append(roc_auc)
-
-# 计算均值和标准差
-mean_tpr = np.mean(tprs, axis=0)
-mean_tpr[-1] = 1.0
-mean_auc = np.mean(aucs)
-std_auc = np.std(aucs)
-
-std_tpr = np.std(tprs, axis=0)
-tprs_upper = np.minimum(mean_tpr + 1.96 * std_tpr, 1)
-tprs_lower = np.maximum(mean_tpr - 1.96 * std_tpr, 0)
-
-# 绘制置信区间
-ax.fill_between(mean_fpr, tprs_lower, tprs_upper, color='lightblue', alpha=0.4,
-                label=f'95% CI (Bootstrap n=1000)')
-
-# 绘制平均 ROC 曲线
-ax.plot(mean_fpr, mean_tpr, color='b', linewidth=2,
-        label=f'Mean ROC (AUC = {mean_auc:.3f} ± {std_auc:.3f})')
-
-# 绘制对角线
-ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Reference')
-
-# 美化
-ax.set_xlabel('1 - Specificity')
-ax.set_ylabel('Sensitivity')
-ax.set_title(f'Bootstrap ROC with 95% CI',
-            fontsize=14)
-ax.legend(loc='lower right', fontsize=10)
-ax.grid(alpha=0.15, linewidth=0.5)
-ax.set_xlim([-0.02, 1.02])
-ax.set_ylim([-0.02, 1.02])
-
-plt.tight_layout()
-plt.savefig('figures/Bootstrap_ROC_Confidence_Band.png', dpi=DPI, bbox_inches='tight')
-print(f"  ✓ 已保存: Bootstrap_ROC_Confidence_Band.png")
-plt.close()
-
-
-"""
-===================================================================================
-风险分层 & NRI 可视化脚本
-===================================================================================
-"""
-
-import os
-import glob
-import joblib
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-from scipy.stats import chi2_contingency, fisher_exact
-from scipy.special import expit as _expit
-from itertools import combinations
-
-DATA_PATH = 'model_results'
-OUTPUT_DIR = 'figures'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-TIMESTAMP = '20260216_1724'
-
-# ============================================================
-# 辅助函数
-# ============================================================
-
-def get_train_source_label(pkg):
-    meta = pkg.get('metadata', {})
-    source = meta.get('train_data_source', 'unknown')
-    if source == 'OOF':
-        return 'Internal'
-    elif source == 'resubstitution':
-        return 'Internal (Resub)'
-    else:
-        return 'Internal'
-
-
-def _sig_mark(p):
-    if p is None or np.isnan(p):
-        return 'N/A'
-    if p < 0.001:  return '***'
-    if p < 0.01:   return '**'
-    if p < 0.05:   return '*'
-    return 'NS'
-
-
-def _safe_logit(p, eps=1e-7):
-    """安全 logit 变换"""
-    p = np.clip(p, eps, 1 - eps)
+# ==========================================================================================
+# 10.1 统计内核 —— IRLS logistic / 校准量 / DeLong / 配对 bootstrap / NRI-IDI
+# ==========================================================================================
+def _incr_logit(p, eps=1e-6):
+    """安全 logit（本脚本无截距校准，这里只是把概率搬到线性尺度作为锚定协变量）"""
+    p = np.clip(np.asarray(p, dtype=float), eps, 1 - eps)
     return np.log(p / (1 - p))
 
 
-def compute_fixed_risk_groups(y_true, y_prob, low_cut=0.05, high_cut=0.15):
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
+def _incr_irls(X, y, max_iter=100, tol=1e-9, ridge=1e-8):
+    """
+    无惩罚 logistic 回归的 IRLS（Newton–Raphson）求解器。
 
-    group_masks = [
-        y_prob < low_cut,
-        (y_prob >= low_cut) & (y_prob < high_cut),
-        y_prob >= high_cut,
-    ]
-    labels = [
-        f'Low (<{low_cut:.0%})',
-        f'Medium ({low_cut:.0%}\u2013{high_cut:.0%})',
-        f'High (\u2265{high_cut:.0%})'
-    ]
+    之所以不直接用 sklearn：本模块要在 bootstrap / 交叉验证里反复拟合上万次
+    只有 2–5 列的小设计矩阵，sklearn 的对象开销会占据绝大部分时间；
+    IRLS 在数学上与 LogisticRegression(penalty=None) 的 MLE 完全等价
+    （ridge=1e-8 仅用于避免完全分离时 Hessian 奇异，对估计值影响可忽略）。
 
-    stats = {}
-    contingency = []
+    返回 (beta, cov, loglik, converged)
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n, k = X.shape
+    beta = np.zeros(k)
+    converged = False
 
-    for g, (mask, label) in enumerate(zip(group_masks, labels)):
-        n = int(mask.sum())
-        events = int(y_true[mask].sum()) if n > 0 else 0
-        non_events = n - events
-        event_rate = events / n if n > 0 else 0.0
-        mean_prob = float(y_prob[mask].mean()) if n > 0 else 0.0
-        stats[g] = {
-            'label': label, 'n': n,
-            'events': events, 'non_events': non_events,
-            'event_rate': event_rate, 'mean_prob': mean_prob,
-        }
-        contingency.append([events, non_events])
+    for _ in range(max_iter):
+        eta = np.clip(X @ beta, -35, 35)
+        mu = expit(eta)
+        w = np.clip(mu * (1 - mu), 1e-10, None)
+        XtW = X.T * w
+        H = XtW @ X + ridge * np.eye(k)
+        g = X.T @ (y - mu) - ridge * beta
+        try:
+            step = np.linalg.solve(H, g)
+        except np.linalg.LinAlgError:
+            break
+        beta_new = beta + step
+        if np.max(np.abs(step)) < tol:
+            beta = beta_new
+            converged = True
+            break
+        beta = beta_new
 
-    contingency_table = np.array(contingency)
-
+    eta = np.clip(X @ beta, -35, 35)
+    mu = expit(eta)
+    loglik = float(np.sum(y * np.log(np.clip(mu, 1e-12, 1)) +
+                          (1 - y) * np.log(np.clip(1 - mu, 1e-12, 1))))
+    w = np.clip(mu * (1 - mu), 1e-10, None)
+    H = (X.T * w) @ X + ridge * np.eye(k)
     try:
-        chi2_stat, overall_p, dof, expected = chi2_contingency(contingency_table)
-        min_expected = expected.min()
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.full((k, k), np.nan)
+    return beta, cov, loglik, converged
+
+
+def _incr_cal_stats(y, p):
+    """
+    校准斜率与截距（Cox 校准）：logit(观察) ~ a·logit(预测) + b。
+    与正文 get_cali_stats() 数学等价，这里改用 IRLS 以便在 bootstrap 中高速调用。
+    """
+    lp = _incr_logit(p)
+    X = np.column_stack([np.ones(len(lp)), lp])
+    beta, _, _, _ = _incr_irls(X, y)
+    return float(beta[1]), float(beta[0])          # slope, intercept
+
+
+def _incr_midrank(x):
+    """DeLong 所需的 mid-rank（并列取平均秩）"""
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    T2 = np.empty(N, dtype=float)
+    T2[J] = T
+    return T2
+
+
+def _incr_fast_delong(pred_sorted, n_pos):
+    """Sun & Xu (2014) 快速 DeLong：返回 (aucs, 协方差矩阵)"""
+    m, n = n_pos, pred_sorted.shape[1] - n_pos
+    pos = pred_sorted[:, :m]
+    neg = pred_sorted[:, m:]
+    k = pred_sorted.shape[0]
+
+    tx = np.empty([k, m]); ty = np.empty([k, n]); tz = np.empty([k, m + n])
+    for r in range(k):
+        tx[r, :] = _incr_midrank(pos[r, :])
+        ty[r, :] = _incr_midrank(neg[r, :])
+        tz[r, :] = _incr_midrank(pred_sorted[r, :])
+
+    aucs = tz[:, :m].sum(axis=1) / m / n - (m + 1.0) / 2.0 / n
+    v01 = (tz[:, :m] - tx[:, :]) / n
+    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
+    sx = np.cov(v01)
+    sy = np.cov(v10)
+    if k == 1:                                   # np.cov 对单行返回标量
+        sx = np.atleast_2d(sx); sy = np.atleast_2d(sy)
+    delongcov = sx / m + sy / n
+    return aucs, delongcov
+
+
+def delong_roc_test(y_true, prob_base, prob_new):
+    """
+    两条相关 ROC 曲线的 DeLong 检验（同一批患者、两套预测 → 必须用相关样本方法）。
+
+    返回 dict：AUROC_base / AUROC_new（各带 95% CI）、Delta、SE、z、p、95% CI。
+    """
+    y = np.asarray(y_true, dtype=int)
+    p1 = np.asarray(prob_base, dtype=float)
+    p2 = np.asarray(prob_new, dtype=float)
+
+    order = (-y).argsort(kind='mergesort')       # 阳性在前
+    n_pos = int(y.sum())
+    if n_pos < 2 or (len(y) - n_pos) < 2:
+        return {k: np.nan for k in
+                ['AUROC_base', 'AUROC_base_lo', 'AUROC_base_hi',
+                 'AUROC_new', 'AUROC_new_lo', 'AUROC_new_hi',
+                 'Delta_AUROC', 'SE', 'z', 'p_value', 'CI_lo', 'CI_hi']}
+
+    pred_sorted = np.vstack((p1, p2))[:, order]
+    try:
+        aucs, cov = _incr_fast_delong(pred_sorted, n_pos)
     except Exception:
-        chi2_stat, overall_p, dof, min_expected = np.nan, np.nan, np.nan, 0
+        return {k: np.nan for k in
+                ['AUROC_base', 'AUROC_base_lo', 'AUROC_base_hi',
+                 'AUROC_new', 'AUROC_new_lo', 'AUROC_new_hi',
+                 'Delta_AUROC', 'SE', 'z', 'p_value', 'CI_lo', 'CI_hi']}
 
-    pairwise_results = []
-    for (i, j) in combinations([0, 1, 2], 2):
-        sub_table = contingency_table[[i, j], :]
-        if sub_table.sum(axis=1).min() == 0:
-            pairwise_results.append({
-                'comparison': f'{labels[i]} vs {labels[j]}',
-                'group_i': i, 'group_j': j,
-                'p_raw': np.nan, 'p_corrected': np.nan,
-                'method': 'N/A (empty group)'
-            })
-            continue
-        if sub_table.min() < 5 or sub_table.sum() < 40:
-            try:
-                _, p_raw = fisher_exact(sub_table)
-                method = 'Fisher'
-            except Exception:
-                _, p_raw, _, _ = chi2_contingency(sub_table, correction=True)
-                method = 'Chi2(Yates)'
-        else:
-            _, p_raw, _, _ = chi2_contingency(sub_table, correction=False)
-            method = 'Chi2'
-        pairwise_results.append({
-            'comparison': f'{labels[i]} vs {labels[j]}',
-            'group_i': i, 'group_j': j,
-            'p_raw': p_raw,
-            'p_corrected': min(p_raw * 3, 1.0),
-            'method': method
-        })
+    delta = float(aucs[1] - aucs[0])
+    var = float(cov[0, 0] + cov[1, 1] - 2 * cov[0, 1])
+    se = float(np.sqrt(max(var, 0.0)))
+    z = delta / se if se > 0 else 0.0
+    p = float(2 * (1 - _norm.cdf(abs(z))))
 
+    se0, se1 = float(np.sqrt(max(cov[0, 0], 0.0))), float(np.sqrt(max(cov[1, 1], 0.0)))
     return {
-        'labels': labels, 'stats': stats,
-        'cutpoints': [low_cut, high_cut],
-        'contingency_table': contingency_table,
-        'overall_chi2': chi2_stat, 'overall_p': overall_p,
-        'overall_dof': dof, 'min_expected': min_expected,
-        'pairwise': pairwise_results,
+        'AUROC_base': float(aucs[0]),
+        'AUROC_base_lo': float(aucs[0] - 1.96 * se0),
+        'AUROC_base_hi': float(aucs[0] + 1.96 * se0),
+        'AUROC_new': float(aucs[1]),
+        'AUROC_new_lo': float(aucs[1] - 1.96 * se1),
+        'AUROC_new_hi': float(aucs[1] + 1.96 * se1),
+        'Delta_AUROC': delta, 'SE': se, 'z': z, 'p_value': p,
+        'CI_lo': delta - 1.96 * se, 'CI_hi': delta + 1.96 * se,
     }
 
 
-def compute_tertile_risk_groups(y_true, y_prob):
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    q33 = np.percentile(y_prob, 33.33)
-    q67 = np.percentile(y_prob, 66.67)
-    group_masks = [
-        y_prob < q33,
-        (y_prob >= q33) & (y_prob < q67),
-        y_prob >= q67,
-    ]
-    labels = [
-        f'Low (<{q33:.3f})',
-        f'Medium ({q33:.3f}\u2013{q67:.3f})',
-        f'High (\u2265{q67:.3f})'
-    ]
-    stats = {}
-    for g, (mask, label) in enumerate(zip(group_masks, labels)):
-        n = int(mask.sum())
-        events = int(y_true[mask].sum()) if n > 0 else 0
-        stats[g] = {
-            'label': label, 'n': n, 'events': events,
-            'non_events': n - events,
-            'event_rate': events / n if n > 0 else 0.0,
-            'mean_prob': float(y_prob[mask].mean()) if n > 0 else 0.0,
-        }
-    return {'labels': labels, 'stats': stats, 'quantiles': [q33, q67]}
-
-
-def save_risk_stratification_csv(fixed_result, model_name, ds_name, output_dir):
-    rows = []
-    for g in range(3):
-        s = fixed_result['stats'][g]
-        rows.append({
-            'Model': model_name, 'Dataset': ds_name,
-            'Risk_Group': s['label'], 'N': s['n'],
-            'Events': s['events'], 'Non_Events': s['non_events'],
-            'Event_Rate': f"{s['event_rate']:.4f}",
-            'Event_Rate_Pct': f"{s['event_rate']:.1%}",
-            'Mean_Predicted_Prob': f"{s['mean_prob']:.4f}",
-        })
-    df_groups = pd.DataFrame(rows)
-
-    comparison_rows = []
-    comparison_rows.append({
-        'Comparison': 'Overall (3-group)', 'Method': 'Chi-square',
-        'P_Value_Raw': f"{fixed_result['overall_p']:.6f}" if not np.isnan(fixed_result['overall_p']) else 'N/A',
-        'P_Value_Corrected': '\u2014',
-        'Significance': _sig_mark(fixed_result['overall_p']),
-    })
-    for pw in fixed_result['pairwise']:
-        comparison_rows.append({
-            'Comparison': pw['comparison'], 'Method': pw['method'],
-            'P_Value_Raw': f"{pw['p_raw']:.6f}" if not np.isnan(pw['p_raw']) else 'N/A',
-            'P_Value_Corrected': f"{pw['p_corrected']:.6f}" if not np.isnan(pw['p_corrected']) else 'N/A',
-            'Significance': _sig_mark(pw['p_corrected']),
-        })
-    df_comparisons = pd.DataFrame(comparison_rows)
-
-    csv_path = f'{output_dir}/Risk_Stratification_Stats_{model_name}_{ds_name}.csv'
-    with open(csv_path, 'w', encoding='utf-8-sig') as f:
-        f.write(f"# Risk Stratification Statistics\n")
-        f.write(f"# Model: {model_name}, Dataset: {ds_name}\n")
-        f.write(f"# Cutpoints (calibrated prob): {fixed_result['cutpoints']}\n\n")
-        f.write("## Group Statistics\n")
-        df_groups.to_csv(f, index=False)
-        f.write(f"\n## Between-Group Comparisons (Bonferroni corrected)\n")
-        df_comparisons.to_csv(f, index=False)
-    print(f"  \u2713 风险分层统计表已保存: {csv_path}")
-    return df_groups, df_comparisons
-
-
-# ============================================================
-# 单数据集绘图函数
-# ============================================================
-def plot_risk_stratification(risk_data, model_name, ds_name, output_dir,
-                             delta_b, low_cut=0.05, high_cut=0.15):
-    """
-    绘制单个数据集的风险分层三合一图 (与原版一致)
-    """
-    y_true = np.asarray(risk_data['y_true'])
-    y_prob_orig = np.asarray(risk_data['y_prob'])
-    y_prob_cal = _expit(_safe_logit(y_prob_orig) + delta_b)
-
-    print(f"  [{ds_name}] 应用 \u0394b = {delta_b:.4f}, "
-          f"Mean prob: {y_prob_orig.mean():.4f} \u2192 {y_prob_cal.mean():.4f}")
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle(f'{ds_name} (Calibrated)', fontsize=14)
-
-    _draw_three_subplots(axes, y_true, y_prob_cal, ds_name, low_cut, high_cut)
-
-    plt.tight_layout()
-    out_path = f'{output_dir}/Risk_Stratification_{model_name}_{ds_name}.png'
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    plt.close()
-    print(f"  \u2713 风险分层图已保存: {out_path}")
-
-    fixed = compute_fixed_risk_groups(y_true, y_prob_cal, low_cut, high_cut)
-    save_risk_stratification_csv(fixed, model_name, ds_name, output_dir)
-    return fixed
-
-
-# ============================================================
-# 核心绘图子函数：在给定的 3 个 axes 上绘制三子图 
-# ============================================================
-def _draw_three_subplots(axes, y_true, y_prob_cal, ds_name,
-                         low_cut=0.05, high_cut=0.15,
-                         panel_prefix=''):
-    """
-    在给定的 3 个 axes 上绘制:
-      axes[0]: 三分位风险分层柱状图
-      axes[1]: 预测概率分布直方图
-      axes[2]: 固定切点三级分层
-
-    完全遵循全局 SCI 样式，无冗余设置。
-    """
-    # --- 确定 panel 标签 ---
-    if panel_prefix:
-        lbl_1 = f'{panel_prefix}1'
-        lbl_2 = f'{panel_prefix}2'
-        lbl_3 = f'{panel_prefix}3'
-    else:
-        lbl_1, lbl_2, lbl_3 = 'A', 'B', 'C'
-
-    # ================================================================
-    # 子图 1: 三分位风险分层
-    # ================================================================
-    ax = axes[0]
-    tertile = compute_tertile_risk_groups(y_true, y_prob_cal)
-
-    labels_t     = tertile['labels']
-    event_rates  = [tertile['stats'][g]['event_rate'] for g in range(3)]
-    mean_probs   = [tertile['stats'][g]['mean_prob']  for g in range(3)]
-    ns_t         = [tertile['stats'][g]['n']           for g in range(3)]
-
-    x_pos = np.arange(len(labels_t))
-    width = 0.35
-    bars1 = ax.bar(x_pos - width / 2, event_rates, width,
-                   label='Observed Event Rate', color='#d62728', alpha=0.8)
-    bars2 = ax.bar(x_pos + width / 2, mean_probs, width,
-                   label='Mean Predicted Prob', color='#1f77b4', alpha=0.8)
-
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([f'{l}\n(n={n})' for l, n in zip(labels_t, ns_t)])
-    ax.set_ylabel('Proportion')
-    ax.set_title(f'{ds_name}: Risk Tertiles', fontsize=10)  # 无加粗
-    sci_legend(ax, loc='upper left')
-    ax.set_ylim(0, 1)
-
-    for bar, val in zip(bars1, event_rates):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-                f'{val:.1%}', ha='center', fontsize=7)
-
-    # ================================================================
-    # 子图 2: 概率分布直方图
-    # ================================================================
-    ax = axes[1]
-    ax.hist(y_prob_cal[y_true == 0], bins=20, alpha=0.6, color='#2ca02c',
-            label='Non-event', density=True)
-    ax.hist(y_prob_cal[y_true == 1], bins=20, alpha=0.6, color='#d62728',
-            label='Event', density=True)
-
-    ax.axvline(low_cut, color='#E08214', linestyle='--', linewidth=1.5,
-               label=f'Low cut = {low_cut:.0%}')
-    ax.axvline(high_cut, color='#B2182B', linestyle='--', linewidth=1.5,
-               label=f'High cut = {high_cut:.0%}')
-
-    ax.axvspan(0, low_cut, alpha=0.06, color='green', zorder=0)
-    ax.axvspan(low_cut, high_cut, alpha=0.06, color='orange', zorder=0)
-    ax.axvspan(high_cut, 1, alpha=0.06, color='red', zorder=0)
-
-    ax.set_xlabel('Predicted probability (calibrated)')
-    ax.set_ylabel('Density')
-    ax.set_title(f'{ds_name}: Probability Distribution', fontsize=10)
-    sci_legend(ax)
-
-    # ================================================================
-    # 子图 3: 固定切点三级分层
-    # ================================================================
-    ax = axes[2]
-    fixed = compute_fixed_risk_groups(y_true, y_prob_cal, low_cut=low_cut, high_cut=high_cut)
-
-    labels_f        = fixed['labels']
-    events_list     = [fixed['stats'][g]['events']     for g in range(3)]
-    non_events_list = [fixed['stats'][g]['non_events'] for g in range(3)]
-    event_rates_f   = [fixed['stats'][g]['event_rate'] for g in range(3)]
-    ns_f            = [fixed['stats'][g]['n']           for g in range(3)]
-
-    y_pos = np.arange(3)
-    ax.barh(y_pos, non_events_list, color='#aec7e8',
-            label='Non-event', edgecolor='white', linewidth=0.5)
-    ax.barh(y_pos, events_list, left=non_events_list,
-            color='#d62728', label='Event', edgecolor='white', linewidth=0.5)
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels([f'{l}\n(n={n})' for l, n in zip(labels_f, ns_f)])
-    ax.set_xlabel('Number of Patients')
-    ax.set_title(f'{ds_name}: Risk Groups (cuts: {low_cut:.0%}, {high_cut:.0%})',
-                 fontsize=10)
-    sci_legend(ax)
-
-    for i, (ne, ev, er) in enumerate(zip(non_events_list, events_list, event_rates_f)):
-        total = ne + ev
-        ax.text(total + max(total * 0.02, 1), i,
-                f'Event rate: {er:.1%}', va='center', fontsize=7, color='#333333')
-
-    p_overall = fixed['overall_p']
-    p_text = (f'Overall \u03c7\u00b2 p = '
-              f'{"<0.001" if p_overall < 0.001 else f"{p_overall:.4f}"}'
-              if not np.isnan(p_overall) else 'Overall p: N/A')
-    ax.text(0.98, 0.02, p_text, transform=ax.transAxes,
-            ha='right', va='bottom', fontsize=7, fontstyle='italic',
-            color='#555555')
-
-    return fixed
-
-
-# ============================================================
-# Combined Panel 绘图函数: Internal + External → 2×3
-# ============================================================
-def plot_risk_stratification_combined(risk_data_internal, risk_data_external,
-                                      model_name, output_dir,
-                                      delta_b_int, delta_b_ext,
-                                      low_cut=0.05, high_cut=0.15,
-                                      model_display_name=None):
-    """
-    将同一模型的 Internal 和 External 风险分层拼为 2×3 Combined Panel。
-
-    布局:
-      上排 (Row 1): Internal Validation  → A1, A2, A3
-      下排 (Row 2): External Validation  → B1, B2, B3
-    """
-    if model_display_name is None:
-        model_display_name = model_name.replace('_', ' ')
-
-    # --- 校准 ---
-    y_true_int = np.asarray(risk_data_internal['y_true'])
-    y_prob_int_orig = np.asarray(risk_data_internal['y_prob'])
-    y_prob_int_cal = _expit(_safe_logit(y_prob_int_orig) + delta_b_int)
-
-    y_true_ext = np.asarray(risk_data_external['y_true'])
-    y_prob_ext_orig = np.asarray(risk_data_external['y_prob'])
-    y_prob_ext_cal = _expit(_safe_logit(y_prob_ext_orig) + delta_b_ext)
-
-    print(f"  [Combined] {model_display_name}")
-    print(f"    Internal: Δb = {delta_b_int:.4f}, "
-          f"Mean prob: {y_prob_int_orig.mean():.4f} → {y_prob_int_cal.mean():.4f}")
-    print(f"    External: Δb = {delta_b_ext:.4f}, "
-          f"Mean prob: {y_prob_ext_orig.mean():.4f} → {y_prob_ext_cal.mean():.4f}")
-
-    # --- 创建 2×3 画布 ---
-    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
-
-    fig.suptitle(f'{model_display_name} — Risk Stratification (Calibrated)',
-                 fontsize=12, y=0.98)  # 无加粗，字号缩小
-
-    # --- 上排: Internal (A, B, C) ---
-    _draw_three_subplots(axes[0, :], y_true_int, y_prob_int_cal,
-                         ds_name='Internal Validation',
-                         low_cut=low_cut, high_cut=high_cut,
-                         panel_prefix='A')
-
-    # --- 下排: External (D, E, F) ---
-    fixed_ext = _draw_three_subplots(axes[1, :], y_true_ext, y_prob_ext_cal,
-                                      ds_name='External Validation',
-                                      low_cut=low_cut, high_cut=high_cut,
-                                      panel_prefix='B')
-
-    # # --- 添加行标签 (左侧大字) ---
-    # fig.text(0.01, 0.72, 'Internal\nValidation',
-    #          fontsize=10, va='center', ha='left',
-    #          rotation=90, color= COLOR_INTERNAL)
-    # fig.text(0.01, 0.28, 'External\nValidation',
-    #          fontsize=10, va='center', ha='left',
-    #          rotation=90, color= COLOR_EXTERNAL)
-
-    # --- 保存 ---
-    plt.tight_layout(rect=[0.03, 0, 1, 0.95])
-    out_path = f'{output_dir}/Risk_Stratification_{model_name}_Combined.png'
-    plt.savefig(out_path, bbox_inches='tight')
-    plt.close()
-    print(f"  \u2713 Combined 风险分层图已保存: {out_path}")
-
-    # --- 同时保存 CSV ---
-    fixed_int = compute_fixed_risk_groups(y_true_int, y_prob_int_cal, low_cut, high_cut)
-    fixed_ext = compute_fixed_risk_groups(y_true_ext, y_prob_ext_cal, low_cut, high_cut)
-    save_risk_stratification_csv(fixed_int, model_name, 'Internal', output_dir)
-    save_risk_stratification_csv(fixed_ext, model_name, 'External', output_dir)
-
-    return fixed_int, fixed_ext
-
-
-# ============================================================
-#  简化版 Combined Panel (仅固定切点分层, 1×2 布局)
-# ============================================================
-def plot_risk_stratification_combined_simple(risk_data_internal, risk_data_external,
-                                             model_name, output_dir,
-                                             delta_b_int, delta_b_ext,
-                                             low_cut=0.05, high_cut=0.15,
-                                             model_display_name=None):
-    """
-    简化版: 仅展示固定切点三级分层 (子图3)，Internal + External → 1×2
-    适合正文 Figure 使用（如 Figure 4A/B）
-    """
-    if model_display_name is None:
-        model_display_name = model_name.replace('_', ' ')
-
-    y_true_int = np.asarray(risk_data_internal['y_true'])
-    y_prob_int_cal = _expit(_safe_logit(np.asarray(risk_data_internal['y_prob'])) + delta_b_int)
-
-    y_true_ext = np.asarray(risk_data_external['y_true'])
-    y_prob_ext_cal = _expit(_safe_logit(np.asarray(risk_data_external['y_prob'])) + delta_b_ext)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(f'{model_display_name} — Risk Group Composition (Calibrated)',
-                 fontsize=12)
-
-    for idx, (ax, y_true, y_prob_cal, ds_name) in enumerate([
-        (axes[0], y_true_int, y_prob_int_cal, 'Internal Validation'),
-        (axes[1], y_true_ext, y_prob_ext_cal, 'External Validation'),
-    ]):
-        fixed = compute_fixed_risk_groups(y_true, y_prob_cal, low_cut, high_cut)
-
-        labels_f        = fixed['labels']
-        events_list     = [fixed['stats'][g]['events']     for g in range(3)]
-        non_events_list = [fixed['stats'][g]['non_events'] for g in range(3)]
-        event_rates_f   = [fixed['stats'][g]['event_rate'] for g in range(3)]
-        ns_f            = [fixed['stats'][g]['n']           for g in range(3)]
-
-        y_pos = np.arange(3)
-        ax.barh(y_pos, non_events_list, color='#aec7e8',
-                label='Non-event', edgecolor='white', linewidth=0.5)
-        ax.barh(y_pos, events_list, left=non_events_list,
-                color='#d62728', label='Event', edgecolor='white', linewidth=0.5)
-
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([f'{l}\n(n={n})' for l, n in zip(labels_f, ns_f)])
-        ax.set_xlabel('Number of Patients')
-        ax.set_title(f'{ds_name}', fontsize=10)  # 无加粗
-        sci_legend(ax)
-
-        for i, (ne, ev, er) in enumerate(zip(non_events_list, events_list, event_rates_f)):
-            total = ne + ev
-            ax.text(total + max(total * 0.02, 1), i,
-                    f'Event rate: {er:.1%}', va='center', fontsize=8, color='#333333')
-
-        p_overall = fixed['overall_p']
-        p_text = (f'Overall \u03c7\u00b2 p = '
-                  f'{"<0.001" if p_overall < 0.001 else f"{p_overall:.4f}"}'
-                  if not np.isnan(p_overall) else 'Overall p: N/A')
-        ax.text(0.98, 0.02, p_text, transform=ax.transAxes,
-                ha='right', va='bottom', fontsize=8, fontstyle='italic', color='#555555')
-
-    plt.tight_layout()
-    out_path = f'{output_dir}/Risk_Stratification_{model_name}_Combined_Simple.png'
-    plt.savefig(out_path, bbox_inches='tight')
-    plt.close()
-    print(f"  \u2713 简化版 Combined 图已保存: {out_path}")
-
-# ============================================================
-# NRI 相关函数
-# ============================================================
-def plot_nri_forest(ax, nri_pkg, train_label):
-    """绘制 NRI / IDI 森林图 (与原版一致)"""
-    metrics_data = []
-    for ds_name, ds_key in [(train_label, 'train'), ('External', 'external')]:
-        nri_res = nri_pkg['nri_results'].get(ds_key)
-        if nri_res is None:
-            continue
-        for metric_name in ['cfNRI', 'IDI']:
-            if metric_name in nri_res:
-                m = nri_res[metric_name]
-                metrics_data.append({
-                    'Dataset': ds_name, 'Metric': metric_name,
-                    'Value': m['value'],
-                    'CI_low': m['95CI'][0], 'CI_high': m['95CI'][1],
-                    'p_value': m['p_value']
-                })
-        if 'categorical_NRI' in nri_res:
-            m = nri_res['categorical_NRI']
-            metrics_data.append({
-                'Dataset': ds_name, 'Metric': 'Cat. NRI',
-                'Value': m['value'],
-                'CI_low': m['95CI'][0], 'CI_high': m['95CI'][1],
-                'p_value': m['p_value']
-            })
-
-    if metrics_data:
-        for i, d in enumerate(metrics_data):
-            color = '#1f77b4' if 'Internal' in d['Dataset'] else '#d62728'
-            ax.errorbar(d['Value'], i,
-                        xerr=[[d['Value'] - d['CI_low']], [d['CI_high'] - d['Value']]],
-                        fmt='o', color=color, capsize=5, markersize=8)
-            sig = ('***' if d['p_value'] < 0.001 else
-                   '**'  if d['p_value'] < 0.01  else
-                   '*'   if d['p_value'] < 0.05  else 'ns')
-            ax.text(d['CI_high'] + 0.02, i,
-                    f"p={d['p_value']:.3f} {sig}", va='center', fontsize=8)
-        ax.set_yticks(range(len(metrics_data)))
-        ax.set_yticklabels([f"{d['Dataset']}\n{d['Metric']}" for d in metrics_data], fontsize=9)
-        ax.axvline(0, color='gray', linestyle='--', linewidth=0.8)
-        legend_elements = [
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#1f77b4',
-                   markersize=8, label=train_label),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d62728',
-                   markersize=8, label='External')
-        ]
-        ax.legend(handles=legend_elements, fontsize=8, loc='upper left')
-    else:
-        ax.text(0.5, 0.5, 'NRI data unavailable', ha='center', va='center',
-                transform=ax.transAxes)
-    ax.set_title('NRI / IDI Forest Plot')
-
-
-def plot_nri_reclassification_detail(nri_pkg, train_label, output_prefix, output_dir):
-    """绘制 NRI 重分类细节图 (与原版一致)"""
-    for ds_name, ds_key in [(f'{train_label.replace(" ", "_")}', 'train'),
-                            ('External', 'external')]:
-        nri_res = nri_pkg['nri_results'].get(ds_key)
-        if nri_res is None:
-            continue
-
-        fig, axes = plt.subplots(1, 3, figsize=(18, 4))
-        fig.suptitle(f'{ds_name} Cohort', fontsize=14, y=1.02)
-
-        # cfNRI 分解
-        ax = axes[0]
-        cf = nri_res['cfNRI']
-        components = ['Events\nComponent', 'Non-events\nComponent', 'Total\ncfNRI']
-        values = [cf['events_component'], cf['non_events_component'], cf['value']]
-        colors = ['#d62728' if v < 0 else '#2ca02c' for v in values]
-        bars = ax.bar(components, values, color=colors, alpha=0.8, edgecolor='none')
-        for bar, val in zip(bars, values):
-            val_range = max(abs(v) for v in values) if values else 1
-            offset = val_range * 0.06
-            y_pos = bar.get_height() + offset if val >= 0 else bar.get_height() - offset
-            ax.text(bar.get_x() + bar.get_width() / 2, y_pos,
-                    f'{val:+.4f}', ha='center',
-                    va='bottom' if val >= 0 else 'top', fontsize=10)
-        ax.axhline(0, color='black', linewidth=0.8)
-        ax.set_ylabel('NRI Component Value')
-        ax.set_title(f'cfNRI Decomposition (Total={cf["value"]:.4f}, p={cf["p_value"]:.4f})', fontsize=10)
-        ax.grid(axis='y', alpha=0.15)
-
-        # IDI 分解
-        ax = axes[1]
-        idi = nri_res['IDI']
-        idi_components = ['Events\n(\u0394 mean prob)', 'Non-events\n(\u0394 mean prob)', 'Total\nIDI']
-        idi_values = [idi['events_component'], idi['non_events_component'], idi['value']]
-        idi_colors = ['#d62728' if v < 0 else '#2ca02c' for v in idi_values]
-        bars = ax.bar(idi_components, idi_values, color=idi_colors, alpha=0.8, edgecolor='none')
-        for bar, val in zip(bars, idi_values):
-            val_range = max(abs(v) for v in idi_values) if idi_values else 1
-            offset = val_range * 0.06
-            y_pos = bar.get_height() + offset if val >= 0 else bar.get_height() - offset
-            ax.text(bar.get_x() + bar.get_width() / 2, y_pos,
-                    f'{val:+.4f}', ha='center',
-                    va='bottom' if val >= 0 else 'top', fontsize=10)
-        ax.axhline(0, color='black', linewidth=0.8)
-        ax.set_ylabel('IDI Component Value')
-        ax.set_title(f'IDI Decomposition (Total={idi["value"]:.4f}, p={idi["p_value"]:.4f})', fontsize=10)
-        ax.grid(axis='y', alpha=0.15)
-
-        # 重分类流向
-        ax = axes[2]
-        detail = cf['detail']
-        categories = ['Events\nUpward', 'Events\nDownward',
-                      'Non-events\nUpward', 'Non-events\nDownward']
-        counts = [detail['event_up'], detail['event_down'],
-                  detail['nonevent_up'], detail['nonevent_down']]
-        bar_colors = ['#2ca02c', '#d62728', '#d62728', '#2ca02c']
-        bars = ax.bar(categories, counts, color=bar_colors, alpha=0.8, edgecolor='none')
-        for bar, val in zip(bars, counts):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(counts) * 0.02,
-                    f'{val}', ha='center', fontsize=10)
-        ax.set_ylabel('Number of Patients')
-        ax.set_title('Reclassification Direction (Green=Correct, Red=Incorrect)', fontsize=10)
-        ax.grid(axis='y', alpha=0.15)
-
-        for a in axes:
-            ymin, ymax = a.get_ylim()
-            margin = (ymax - ymin) * 0.18
-            a.set_ylim(bottom=ymin - margin, top=ymax + margin)
-
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        out_path = f'{output_dir}/NRI_Reclassification_Detail_{output_prefix}_{ds_name}.png'
-        plt.savefig(out_path, dpi=600, bbox_inches='tight')
-        plt.close()
-        print(f"  \u2713 重分类细节图已保存: {out_path}")
-
-
-def plot_reclassification_heatmap(nri_pkg, train_label, new_model_label,
-                                  old_model_label, output_prefix, output_dir):
-    """绘制分类NRI重分类表热图 (与原版一致)"""
-    for ds_name, ds_key in [(f'{train_label.replace(" ", "_")}', 'train'),
-                            ('External', 'external')]:
-        nri_res = nri_pkg['nri_results'].get(ds_key)
-        if nri_res is None or 'categorical_NRI' not in nri_res:
-            print(f"  \u26a0\ufe0f {ds_name} 无分类NRI数据，跳过")
-            continue
-
-        cat_nri = nri_res['categorical_NRI']
-        reclass_events = cat_nri.get('reclassification_table_events')
-        reclass_non_events = cat_nri.get('reclassification_table_non_events')
-        if reclass_events is None:
-            continue
-
-        n_cats = reclass_events.shape[0]
-        cat_labels = ['Low Risk', 'High Risk'] if n_cats == 2 else [f'Cat {i}' for i in range(n_cats)]
-
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        fig.suptitle(f'{ds_name} Cohort')
-
-        for idx, (table, group_name) in enumerate([
-            (reclass_events, 'Recurrence'), (reclass_non_events, 'Non-recurrence')
-        ]):
-            ax = axes[idx]
-            im = ax.imshow(table, cmap='YlOrRd', aspect='auto')
-            ax.set_xticks(range(n_cats))
-            ax.set_yticks(range(n_cats))
-            ax.set_xticklabels(cat_labels, fontsize=9)
-            ax.set_yticklabels(cat_labels, fontsize=9)
-            ax.set_xlabel(new_model_label, fontsize=10)
-            ax.set_ylabel(old_model_label, fontsize=10)
-            ax.set_title(group_name)
-            for i in range(n_cats):
-                for j in range(n_cats):
-                    val = table[i, j]
-                    text_color = 'white' if val > table.max() * 0.6 else 'black'
-                    ax.text(j, i, str(val), ha='center', va='center', fontsize=12, color=text_color)
-            for _, spine in ax.spines.items():
-                spine.set_visible(True)
-                spine.set_color('black')
-                spine.set_linewidth(1.0)
-            ax.tick_params(axis='both', which='both', length=0)
-            plt.colorbar(im, ax=ax, shrink=0.8)
-
-        plt.tight_layout()
-        out_path = f'{output_dir}/Reclassification_Table_{output_prefix}_{ds_name}.png'
-        plt.savefig(out_path, dpi=600, bbox_inches='tight')
-        plt.close()
-        print(f"  \u2713 重分类表热图已保存: {out_path}")
-
-
-###########################################################################
-#                                                                         #
-#  Part 1: 术前 vs 术中 模型对比可视化                                      #
-#                                                                         #
-###########################################################################
-
-print("\n" + "#" * 80)
-print("#  Part 1: 术前 vs 术中 模型对比可视化")
-print("#" * 80)
-
-# ============================================================
-# 1. 加载数据
-# ============================================================
-print("\n" + "=" * 70)
-print("\U0001f4e6 加载数据包 (术前 vs 术中)")
-print("=" * 70)
-
-preop_files = sorted(glob.glob(f"{DATA_PATH}/Model_Package_{TIMESTAMP}.pkl"))
-preop_pkg = joblib.load(preop_files[-1]) if preop_files else None
-if preop_pkg:
-    print(f"  \u2713 已加载术前模型: {preop_files[-1]}")
-else:
-    print("  \u26a0\ufe0f 未找到术前模型数据包")
-
-sens_files = sorted(glob.glob(f'{DATA_PATH}/Sensitivity_Model_Package_latest.pkl'))
-sens_pkg = joblib.load(sens_files[-1]) if sens_files else None
-if sens_pkg:
-    print(f"  \u2713 已加载术中模型: {sens_files[-1]}")
-else:
-    print("  \u26a0\ufe0f 未找到术中模型数据包")
-
-nri_files = sorted(glob.glob(f'{DATA_PATH}/NRI_Comparison_Data_latest.pkl'))
-nri_pkg_intraop = joblib.load(nri_files[-1]) if nri_files else None
-if nri_pkg_intraop:
-    print(f"  \u2713 已加载NRI数据包: {nri_files[-1]}")
-    train_source = nri_pkg_intraop.get('metadata', {}).get('train_data_source', 'unknown')
-    print(f"    训练集数据源: {train_source}")
-else:
-    print("  \u26a0\ufe0f 未找到NRI数据包")
-
-print()
-
-
-# ============================================================
-# 2. 风险分层图 — 术前模型 (单独 + Combined) 
-# ============================================================
-print("=" * 70)
-print("\U0001f4ca [Step 2] 风险分层图 — 术前模型")
-print("=" * 70)
-
-if preop_pkg:
-    risk_strat = preop_pkg.get('risk_stratification', {})
-
-    # --- 2a. 仍生成单独的 Internal / External 图 ---
-    for ds_name, ds_key, db in [
-        ('Internal', 'train',    delta_b_int),
-        ('External', 'external', delta_b_ext),
-    ]:
-        risk_data = risk_strat.get(ds_key)
-        if risk_data is None:
-            print(f"  \u26a0\ufe0f 术前模型缺少 {ds_name} 风险分层数据")
-            continue
-        plot_risk_stratification(risk_data, 'Preoperative_Model', ds_name, OUTPUT_DIR,
-                                 delta_b=db)
-
-    # --- 2b. [NEW] 生成 Combined Panel (2×3) ---
-    risk_int = risk_strat.get('train')
-    risk_ext = risk_strat.get('external')
-    if risk_int is not None and risk_ext is not None:
-        print("\n  --- 生成 Combined Panel ---")
-        plot_risk_stratification_combined(
-            risk_int, risk_ext,
-            model_name='Preoperative_Model',
-            output_dir=OUTPUT_DIR,
-            delta_b_int=delta_b_int,
-            delta_b_ext=delta_b_ext,
-            model_display_name='Preoperative Model'
-        )
-        # 同时生成简化版 (仅固定切点, 1×2, 适合正文 Fig 4)
-        plot_risk_stratification_combined_simple(
-            risk_int, risk_ext,
-            model_name='Preoperative_Model',
-            output_dir=OUTPUT_DIR,
-            delta_b_int=delta_b_int,
-            delta_b_ext=delta_b_ext,
-            model_display_name='Preoperative Model'
-        )
-else:
-    print("  \u26a0\ufe0f 术前模型数据包不可用，跳过")
-
-print()
-
-
-# ============================================================
-# 3. 风险分层图 — 术中模型 (单独 + Combined) 
-# ============================================================
-print("=" * 70)
-print("\U0001f4ca [Step 3] 风险分层图 — 术中模型")
-print("=" * 70)
-
-if sens_pkg:
-    risk_strat_intra = sens_pkg.get('risk_stratification', {})
-
-    # --- 3a. 单独图 ---
-    for ds_name, ds_key, db in [
-        ('Internal', 'train',    delta_b_int),
-        ('External', 'external', delta_b_ext),
-    ]:
-        risk_data = risk_strat_intra.get(ds_key)
-        if risk_data is None:
-            continue
-        plot_risk_stratification(risk_data, 'PreIntraop_Model', ds_name, OUTPUT_DIR,
-                                 delta_b=db)
-
-    # --- 3b. [NEW] Combined Panel ---
-    risk_int = risk_strat_intra.get('train')
-    risk_ext = risk_strat_intra.get('external')
-    if risk_int is not None and risk_ext is not None:
-        print("\n  --- 生成 Combined Panel ---")
-        plot_risk_stratification_combined(
-            risk_int, risk_ext,
-            model_name='PreIntraop_Model',
-            output_dir=OUTPUT_DIR,
-            delta_b_int=delta_b_int,
-            delta_b_ext=delta_b_ext,
-            model_display_name='Pre+Intraoperative Model'
-        )
-else:
-    print("  \u26a0\ufe0f 术中模型数据包不可用，跳过")
-
-print()
-
-
-# ============================================================
-# 4-7: NRI 对比可视化
-# ============================================================
-print("=" * 70)
-print("\U0001f4ca [Step 4] NRI 对比可视化 — 术前 vs 术中")
-print("=" * 70)
-
-if nri_pkg_intraop:
-    train_label = get_train_source_label(nri_pkg_intraop)
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
-    fig.suptitle('Preoperative vs. Pre+Intraoperative', fontsize=14)
-
-    # 4-1: NRI/IDI 森林图
-    ax = axes[0, 0]
-    ax.set_xlabel('Improvement (Pre+Intraop - Preop)')
-    plot_nri_forest(ax, nri_pkg_intraop, train_label)
-
-    # 4-2: 概率散点图
-    ax = axes[0, 1]
-    prob_old = nri_pkg_intraop['preop_model']['prob_external']
-    prob_new = nri_pkg_intraop['intraop_model']['prob_external']
-    y_ext = nri_pkg_intraop['y_external']
-    scatter_colors = ['#2ca02c' if y == 0 else '#d62728' for y in y_ext]
-    ax.scatter(prob_old, prob_new, c=scatter_colors, alpha=0.6, s=30,
-               edgecolors='white', linewidth=0.5)
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8, alpha=0.5)
-    ax.set_xlabel('Preoperative Model Probability')
-    ax.set_ylabel('Pre+Intraop Model Probability')
-    ax.set_title('Probability Scatter (External Validation)')
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='#d62728',
-               markersize=8, label='Event (Recurrence)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ca02c',
-               markersize=8, label='Non-event')
-    ]
-    ax.legend(handles=legend_elements, fontsize=8)
-    ax.annotate('Pre+Intraop \u2191\npredicts higher',
-                xy=(0.15, 0.85), fontsize=8, color='gray', ha='center', va='center')
-    ax.annotate('Preop \u2191\npredicts higher',
-                xy=(0.85, 0.15), fontsize=8, color='gray', ha='center', va='center')
-
-    # 4-3 / 4-4: 风险分层对比 (外部)
-    y_ext_nri = nri_pkg_intraop['y_external']
-    for idx, (model_key, model_label) in enumerate([
-        ('preop_model', 'Preoperative'),
-        ('intraop_model', 'Pre+Intraoperative')
-    ]):
-        ax = axes[1, idx]
-        prob_orig = nri_pkg_intraop[model_key]['prob_external']
-        db_this, prob_cal_this, _ = intercept_only_recalibration(
-            y_ext_nri, prob_orig, method='mle')
-        tertile_cal = compute_tertile_risk_groups(y_ext_nri, prob_cal_this)
-        labels = tertile_cal['labels']
-        event_rates = [tertile_cal['stats'][g]['event_rate'] for g in range(3)]
-        ns = [tertile_cal['stats'][g]['n'] for g in range(3)]
-        bar_colors = ['#2ca02c', '#ff7f0e', '#d62728']
-        bars = ax.bar(labels, event_rates, color=bar_colors, alpha=0.8)
-        for bar, val, n in zip(bars, event_rates, ns):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.02,
-                    f'{val:.1%}\n(n={n})', ha='center', fontsize=9)
-        auc_key = model_key.replace('_model', '')
-        auc_val = nri_pkg_intraop['auc_comparison']['external'][auc_key]
-        ax.set_title(f'{model_label} (Calibrated)\n'
-                     f'External AUC = {auc_val:.3f}, \u0394b = {db_this:.3f}')
-        ax.set_ylabel('Event Rate')
-        ax.set_ylim(0, 1)
-        ax.set_xlabel('Risk Tertile')
-
-    plt.tight_layout()
-    out_path = f'{OUTPUT_DIR}/NRI_Intraop_Model_Comparison.png'
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    plt.close()
-    print(f"  \u2713 NRI 对比图已保存: {out_path}")
-else:
-    print("  \u26a0\ufe0f 未找到 NRI 数据包")
-
-print()
-
-# Step 5: NRI 重分类细节图
-print("=" * 70)
-print("\U0001f4ca [Step 5] NRI 重分类细节图 — 术中模型")
-print("=" * 70)
-if nri_pkg_intraop:
-    train_label = get_train_source_label(nri_pkg_intraop)
-    plot_nri_reclassification_detail(nri_pkg_intraop, train_label,
-                                     output_prefix='Intraop', output_dir=OUTPUT_DIR)
-print()
-
-# Step 6: AUC 对比汇总
-print("=" * 70)
-print("\U0001f4ca [Step 6] AUC 对比汇总图 — 术中模型")
-print("=" * 70)
-if nri_pkg_intraop:
-    auc_data = nri_pkg_intraop['auc_comparison']
-    train_label = get_train_source_label(nri_pkg_intraop)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    datasets = [f'Internal Validation ({auc_data["train"].get("data_source", "OOF")})', 'External']
-    auc_preop = [auc_data['train']['preop'], auc_data['external']['preop']]
-    auc_intraop = [auc_data['train']['intraop'], auc_data['external']['intraop']]
-    x = np.arange(len(datasets))
-    width = 0.3
-    bars1 = ax.bar(x - width / 2, auc_preop, width, label='Preoperative', color='#80C764', alpha=0.85)
-    bars2 = ax.bar(x + width / 2, auc_intraop, width, label='Pre+Intraoperative', color='#E38D80', alpha=0.85)
-    for bar, val in zip(bars1, auc_preop):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005, f'{val:.3f}', ha='center', fontsize=10)
-    for bar, val in zip(bars2, auc_intraop):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005, f'{val:.3f}', ha='center', fontsize=10)
-    for i in range(len(datasets)):
-        delta = auc_intraop[i] - auc_preop[i]
-        y_max = max(auc_preop[i], auc_intraop[i])
-        ax.annotate(f'\u0394={delta:+.3f}', xy=(x[i], y_max + 0.025),
-                    fontsize=9, ha='center', color='#333333', fontstyle='italic')
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets, fontsize=10)
-    ax.set_ylabel('AUC')
-    ax.set_title('Pre- vs. Pre+Intraoperative', fontsize=13)
-    ax.legend(fontsize=9, loc='upper right')
-    ax.set_ylim(0.5, 1.0)
-    ax.grid(axis='y', alpha=0.15)
-    plt.tight_layout()
-    out_path = f'{OUTPUT_DIR}/AUC_Comparison_Intraop.png'
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    plt.close()
-    print(f"  \u2713 AUC 对比图已保存: {out_path}")
-
-print()
-
-# Step 7: 分类NRI重分类表热图
-print("=" * 70)
-print("\U0001f4ca [Step 7] 分类NRI 重分类表热图 — 术中模型")
-print("=" * 70)
-if nri_pkg_intraop:
-    train_label = get_train_source_label(nri_pkg_intraop)
-    plot_reclassification_heatmap(nri_pkg_intraop, train_label,
-                                  new_model_label='Pre+Intraoperative',
-                                  old_model_label='Preoperative',
-                                  output_prefix='Intraop', output_dir=OUTPUT_DIR)
-
-print()
-print("=" * 70)
-print("\U0001f389 Part 1 完成!")
-print("=" * 70)
-
-
-###########################################################################
-#                                                                         #
-#  Part 2: 术前 vs 裂孔聚类 模型对比可视化                                  #
-#                                                                         #
-###########################################################################
-
-print("\n" + "#" * 80)
-print("#  Part 2: 术前 vs 裂孔聚类 模型对比可视化")
-print("#" * 80)
-
-# 1. 加载数据
-print("\n" + "=" * 70)
-print("\U0001f4e6 加载数据包 (术前 vs 裂孔聚类)")
-print("=" * 70)
-
-if preop_pkg:
-    print(f"  \u2713 原术前模型已加载 (复用)")
-
-sens_bc_files = sorted(glob.glob(f'{DATA_PATH}/Sensitivity_BreakCluster_Package_latest.pkl'))
-sens_bc_pkg = joblib.load(sens_bc_files[-1]) if sens_bc_files else None
-if sens_bc_pkg:
-    print(f"  \u2713 已加载裂孔聚类模型: {sens_bc_files[-1]}")
-
-nri_bc_files = sorted(glob.glob(f'{DATA_PATH}/NRI_BreakCluster_Comparison_Data_latest.pkl'))
-nri_pkg_cluster = joblib.load(nri_bc_files[-1]) if nri_bc_files else None
-if nri_pkg_cluster:
-    print(f"  \u2713 已加载NRI对比数据包: {nri_bc_files[-1]}")
-    train_source = nri_pkg_cluster.get('metadata', {}).get('train_data_source', 'unknown')
-    print(f"    训练集数据源: {train_source}")
-
-print()
-
-
-# 3. 风险分层图 — 裂孔聚类模型 (单独 + Combined) 
-print("=" * 70)
-print("\U0001f4ca [Step 3] 风险分层图 — 裂孔聚类模型")
-print("=" * 70)
-
-if sens_bc_pkg:
-    risk_strat_cluster = sens_bc_pkg.get('risk_stratification', {})
-
-    # --- 单独图 ---
-    for ds_name, ds_key, db in [
-        ('Internal', 'train',    delta_b_int),
-        ('External', 'external', delta_b_ext),
-    ]:
-        risk_data = risk_strat_cluster.get(ds_key)
-        if risk_data is None:
-            continue
-        plot_risk_stratification(risk_data, 'BreakCluster_Model', ds_name, OUTPUT_DIR,
-                                 delta_b=db)
-
-    # --- Combined Panel ---
-    risk_int = risk_strat_cluster.get('train')
-    risk_ext = risk_strat_cluster.get('external')
-    if risk_int is not None and risk_ext is not None:
-        print("\n  --- 生成 Combined Panel ---")
-        plot_risk_stratification_combined(
-            risk_int, risk_ext,
-            model_name='BreakCluster_Model',
-            output_dir=OUTPUT_DIR,
-            delta_b_int=delta_b_int,
-            delta_b_ext=delta_b_ext,
-            model_display_name='Break Cluster Model'
-        )
-else:
-    print("  \u26a0\ufe0f 裂孔聚类模型数据包不可用，跳过")
-
-print()
-
-
-
-# ============================================================
-# 4. NRI 对比可视化
-# ============================================================
-print("=" * 70)
-print("📊 [Step 4] NRI 对比可视化 — 原术前 vs 裂孔聚类")
-print("=" * 70)
-
-if nri_pkg_cluster:
-    train_label = get_train_source_label(nri_pkg_cluster)
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
-    fig.suptitle('Original Preop vs Break Cluster',
-                 fontsize=14)
-
-    # ----------------------------------------------------------
-    # 图 4-1: NRI / IDI 森林图
-    # ----------------------------------------------------------
-    ax = axes[0, 0]
-    ax.set_xlabel('Improvement (Break Cluster - Original)')
-    plot_nri_forest(ax, nri_pkg_cluster, train_label)
-
-    # ----------------------------------------------------------
-    # 图 4-2: 概率散点图（外部验证集）
-    # ----------------------------------------------------------
-    ax = axes[0, 1]
-    prob_old = nri_pkg_cluster['preop_model']['prob_external']
-    prob_new = nri_pkg_cluster['cluster_model']['prob_external']
-    y_ext    = nri_pkg_cluster['y_external']
-
-    scatter_colors = ['#2ca02c' if y == 0 else '#d62728' for y in y_ext]
-    ax.scatter(prob_old, prob_new, c=scatter_colors, alpha=0.6, s=30,
-               edgecolors='white', linewidth=0.5)
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8, alpha=0.5)
-    ax.set_xlabel('Original Preop Model Probability')
-    ax.set_ylabel('Break Cluster Model Probability')
-    ax.set_title('Probability Scatter (External Validation)')
-    ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-0.02, 1.02)
-
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='#d62728',
-               markersize=8, label='Event (Recurrence)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ca02c',
-               markersize=8, label='Non-event')
-    ]
-    ax.legend(handles=legend_elements, fontsize=8)
-
-    ax.annotate('Break Cluster ↑\npredicts higher',
-                xy=(0.15, 0.85), fontsize=8, color='gray',
-                ha='center', va='center')
-    ax.annotate('Original ↑\npredicts higher',
-                xy=(0.85, 0.15), fontsize=8, color='gray',
-                ha='center', va='center')
-
-    # ----------------------------------------------------------
-    # 图 4-3 / 4-4: 两模型风险分层对比（外部验证集）—— 校准后
-    # ----------------------------------------------------------
-    y_ext_nri = nri_pkg_cluster['y_external']
-
-    for idx, (model_key, model_label, auc_key) in enumerate([
-        ('preop_model',   'Original Preop', 'preop'),
-        ('cluster_model', 'Break Cluster',  'cluster')
-    ]):
-        ax = axes[1, idx]
-
-        # 取该模型的原始概率
-        prob_orig = nri_pkg_cluster[model_key]['prob_external']
-
-        # 为该模型单独计算截距校准
-        db_this, prob_cal_this, _ = intercept_only_recalibration(
-            y_ext_nri, prob_orig, method='mle')
-        print(f"    {model_label.split(chr(10))[0]} 外部 Δb = {db_this:.4f}")
-
-        # 用校准后概率重新计算三分位
-        tertile_cal = compute_tertile_risk_groups(y_ext_nri, prob_cal_this)
-
-        labels      = tertile_cal['labels']
-        event_rates = [tertile_cal['stats'][g]['event_rate'] for g in range(3)]
-        ns          = [tertile_cal['stats'][g]['n']           for g in range(3)]
-
-        bar_colors = ['#2ca02c', '#ff7f0e', '#d62728']
-        bars = ax.bar(labels, event_rates, color=bar_colors, alpha=0.8)
-        for bar, val, n in zip(bars, event_rates, ns):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.02,
-                    f'{val:.1%}\n(n={n})', ha='center', fontsize=9)
-
-        auc_val = nri_pkg_cluster['auc_comparison']['external'][auc_key]
-        ax.set_title(f'{model_label} (Calibrated)\n'
-                     f'External AUC = {auc_val:.3f}, Δb = {db_this:.3f}')
-        ax.set_ylabel('Event Rate')
-        ax.set_ylim(0, 1)
-        ax.set_xlabel('Risk Tertile')
-
-    plt.tight_layout()
-    out_path = f'{OUTPUT_DIR}/NRI_BreakCluster_Model_Comparison.png'
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ NRI 对比图已保存: {out_path}")
-
-else:
-    print("  ⚠️ 未找到 NRI 数据包，请先运行 4_裂孔聚类_敏感性_生存分析.py")
-
-print()
-
-
-# ============================================================
-# 5. 补充图: NRI 重分类细节图（事件组 / 非事件组）
-# ============================================================
-print("=" * 70)
-print("📊 [Step 5] NRI 重分类细节图 — 裂孔聚类")
-print("=" * 70)
-
-if nri_pkg_cluster:
-    train_label = get_train_source_label(nri_pkg_cluster)
-    plot_nri_reclassification_detail(
-        nri_pkg_cluster, train_label,
-        output_prefix='BreakCluster', output_dir=OUTPUT_DIR)
-
-print()
-
-
-# ============================================================
-# 6. 补充图: AUC 对比汇总柱状图
-# ============================================================
-print("=" * 70)
-print("📊 [Step 6] AUC 对比汇总图 — 裂孔聚类")
-print("=" * 70)
-
-if nri_pkg_cluster:
-    auc_data = nri_pkg_cluster['auc_comparison']
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    datasets = [f'Internal Validation ({auc_data["train"].get("data_source", "OOF")})',
-                'External']
-    auc_preop   = [auc_data['train']['preop'],     auc_data['external']['preop']]
-    auc_cluster = [auc_data['train']['cluster'],   auc_data['external']['cluster']]
-
-    x = np.arange(len(datasets))
-    width = 0.3
-
-    bars1 = ax.bar(x - width / 2, auc_preop, width,
-                   label='Original Preop', color="#80C764", alpha=0.85)
-    bars2 = ax.bar(x + width / 2, auc_cluster, width,
-                   label='Break Cluster', color="#E38D80", alpha=0.85)
-
-    for bar, val in zip(bars1, auc_preop):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                f'{val:.3f}', ha='center', fontsize=10)
-    for bar, val in zip(bars2, auc_cluster):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                f'{val:.3f}', ha='center', fontsize=10)
-
-    for i in range(len(datasets)):
-        delta = auc_cluster[i] - auc_preop[i]
-        y_max = max(auc_preop[i], auc_cluster[i])
-        ax.annotate(f'Δ={delta:+.3f}',
-                    xy=(x[i], y_max + 0.025),
-                    fontsize=9, ha='center', color='#333333', fontstyle='italic')
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets, fontsize=10)
-    ax.set_ylabel('AUC')
-    ax.set_title('Original Preop vs Break Cluster Model',
-                 fontsize=13)
-    ax.legend(fontsize=9, loc='upper right')
-    ax.set_ylim(0.5, 1.0)
-    ax.grid(axis='y', alpha=0.15, linewidth=0.5)
-
-    plt.tight_layout()
-    out_path = f'{OUTPUT_DIR}/AUC_Comparison_BreakCluster.png'
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ AUC 对比图已保存: {out_path}")
-else:
-    print("  ⚠️ NRI 数据包不可用，跳过")
-
-
-# ============================================================
-# 7. 补充图: 分类NRI重分类表热图
-# ============================================================
-print()
-print("=" * 70)
-print("📊 [Step 7] 分类NRI 重分类表热图 — 裂孔聚类")
-print("=" * 70)
-
-if nri_pkg_cluster:
-    train_label = get_train_source_label(nri_pkg_cluster)
-    plot_reclassification_heatmap(
-        nri_pkg_cluster, train_label,
-        new_model_label='Break Cluster Model',
-        old_model_label='Original Preop Model',
-        output_prefix='BreakCluster', output_dir=OUTPUT_DIR)
-
-print()
-print("=" * 70)
-print("🎉 Part 2 完成: 裂孔聚类敏感性分析可视化！")
-print("=" * 70)
-print(f"\n  📁 所有图片已保存至: {OUTPUT_DIR}/")
-print(f"  📊 生成图片清单:")
-
-for f in sorted(os.listdir(OUTPUT_DIR)):
-    if f.endswith('.png') and ('BreakCluster' in f or 'Preoperative' in f):
-        print(f"     • {f}")
-
-print()
-print("=" * 70)
-print("🎉 敏感性分析可视化完成！")
-print("=" * 70)
-
-# ============================================================
-# 特征频率可视化（完整版）
-# ============================================================
-from matplotlib.patches import Rectangle
-
-# ------------------------------------------
-# 数据加载
-# ------------------------------------------
-# 主模型
-package = joblib.load(f"{DATA_PATH}/Model_Package_{TIMESTAMP}.pkl")
-best_model_name = package['best_model_name']
-freq_df = pd.read_csv(f"{DATA_PATH}/Feature_Selection_Frequency_{TIMESTAMP}.csv")
-rename_df_feature_col(freq_df)  # ✅ 映射为 SCI 展示标签
-
-# 术中模型 & 裂孔聚类模型
-pkg_intra = joblib.load(f"{DATA_PATH}/Sensitivity_Model_Package_latest.pkl")
-pkg_cluster = joblib.load(f"{DATA_PATH}/Sensitivity_BreakCluster_Package_latest.pkl")
-
-best_intra = pkg_intra['best_model_name']
-best_cluster = pkg_cluster['best_model_name']
-
-freq_intra = pd.read_csv(f"{DATA_PATH}/Feature_Selection_Frequency_20260220_2214.csv")
-freq_cluster = pd.read_csv(f"{DATA_PATH}/Feature_Selection_Frequency_20260220_2220.csv")
-rename_df_feature_col(freq_intra)    # ✅ 映射为 SCI 展示标签
-rename_df_feature_col(freq_cluster)  # ✅ 映射为 SCI 展示标签
-
-print(f"主模型: {best_model_name}, 特征数: {len(freq_df[freq_df['Model']==best_model_name])}")
-print(f"术中模型: {best_intra}, 特征数: {len(freq_intra[freq_intra['Model']==best_intra])}")
-print(f"裂孔聚类: {best_cluster}, 特征数: {len(freq_cluster[freq_cluster['Model']==best_cluster])}")
-
-# 三个场景的配置
-SCENARIOS = {
-    'Original Preop Model': {
-        'timestamp': TIMESTAMP,
-        'package': package,
-        'best_model': best_model_name,
-        'freq_df': freq_df,
-    },
-    'Pre+Intraoperative Model': {
-        'timestamp': '20260220_2214',
-        'package': pkg_intra,
-        'best_model': best_intra,
-        'freq_df': freq_intra,
-    },
-    'Break Cluster Model': {
-        'timestamp': '20260220_2220',
-        'package': pkg_cluster,
-        'best_model': best_cluster,
-        'freq_df': freq_cluster,
-    },
+# ---- 参与配对 bootstrap 的指标清单（顺序即 CSV / 森林图的行序）----
+_INCR_BOOT_METRICS = ['AUROC', 'AP', 'Brier', 'Scaled_Brier',
+                      'Cal_slope', 'Cal_intercept', 'OE', 'NB_at_threshold']
+
+_INCR_METRIC_LABEL = {
+    'AUROC':           'ΔAUROC',
+    'AP':              'ΔAP',
+    'Brier':           'ΔBrier',
+    'Scaled_Brier':    'ΔScaled Brier (IPA)',
+    'Cal_slope':       'ΔCalibration slope',
+    'Cal_intercept':   'ΔCalibration intercept',
+    'OE':              'ΔO:E ratio',
+    'NB_at_threshold': 'ΔNet benefit @ threshold',
 }
 
-# ============================================================
-# 图1: 棒棒糖图 - LASSO特征选择稳定性
-# ============================================================
-def plot_lollipop_chart(data, model_name, title_suffix='', save_path=None):
-    """
-    棒棒糖图：展示LASSO在交叉验证中选择每个特征的稳定性
-    """
-    fig, ax = plt.subplots(figsize=(4.5, max(4, len(data) * 0.4)))
+# 「越大越好」的指标（决定图上箭头注释与结论判断方向）
+_INCR_HIGHER_BETTER = {'AUROC': True, 'AP': True, 'Brier': False, 'Scaled_Brier': True,
+                       'Cal_slope': None, 'Cal_intercept': None, 'OE': None,
+                       'NB_at_threshold': True}
 
-    colors = []
-    for freq in data['Selection_Freq']:
-        if freq >= 0.8:
-            colors.append('#2ecc71')
-        elif freq >= 0.5:
-            colors.append('#f39c12')
+
+def _incr_metric_battery(y, p, threshold, full=False):
+    """一次性算全套指标；full=True 时追加 H-L 与阈值处的分类指标（仅点估计用）"""
+    y = np.asarray(y, dtype=int)
+    p = np.asarray(p, dtype=float)
+    out = {'N': len(y), 'Events': int(y.sum()), 'Event_rate': float(y.mean())}
+
+    out['AUROC'] = float(roc_auc_score(y, p))
+    out['AP'] = float(average_precision_score(y, p))
+    out['Brier'] = float(brier_score_loss(y, p))
+    pbar = float(y.mean())
+    out['Scaled_Brier'] = (1 - out['Brier'] / (pbar * (1 - pbar))) if 0 < pbar < 1 else np.nan
+
+    slope, intercept = _incr_cal_stats(y, p)
+    out['Cal_slope'], out['Cal_intercept'] = slope, intercept
+    out['OE'] = float(y.sum() / p.sum()) if p.sum() > 0 else np.nan
+    out['NB_at_threshold'] = float(calculate_net_benefit(y, p, threshold))
+
+    if full:
+        try:
+            hl, hlp = hosmer_lemeshow_test(y, p, n_groups=10)
+        except Exception:
+            hl, hlp = np.nan, np.nan
+        out['HL_chi2'], out['HL_p'] = hl, hlp
+
+        yhat = (p >= threshold).astype(int)
+        tp = int(((yhat == 1) & (y == 1)).sum()); fp = int(((yhat == 1) & (y == 0)).sum())
+        tn = int(((yhat == 0) & (y == 0)).sum()); fn = int(((yhat == 0) & (y == 1)).sum())
+        out['TP'], out['FP'], out['TN'], out['FN'] = tp, fp, tn, fn
+        out['Sensitivity'] = tp / (tp + fn) if (tp + fn) else np.nan
+        out['Specificity'] = tn / (tn + fp) if (tn + fp) else np.nan
+        out['PPV'] = tp / (tp + fp) if (tp + fp) else np.nan
+        out['NPV'] = tn / (tn + fn) if (tn + fn) else np.nan
+    return out
+
+
+def _incr_boot_indices(y, n_boot, seed):
+    """
+    分层 bootstrap 的下标序列（事件组与非事件组各自有放回抽样）。
+
+    分层而非简单重采样，是因为外部队列事件数偏少时，简单重采样有一定概率
+    抽出 0 个事件，导致 AUROC / AP / 校准斜率无定义；分层可保证每次重采样的
+    事件数恒定，Δ 指标的 bootstrap 分布也更稳定。
+    """
+    y = np.asarray(y, dtype=int)
+    pos = np.where(y == 1)[0]
+    neg = np.where(y == 0)[0]
+    rng = np.random.RandomState(seed)
+    for _ in range(n_boot):
+        yield np.concatenate([rng.choice(pos, pos.size, replace=True),
+                              rng.choice(neg, neg.size, replace=True)])
+
+
+def _incr_pct_ci(samples, lo=2.5, hi=97.5):
+    s = np.asarray([v for v in samples if np.isfinite(v)], dtype=float)
+    if s.size < 20:
+        return np.nan, np.nan
+    return float(np.percentile(s, lo)), float(np.percentile(s, hi))
+
+
+def _incr_boot_p(samples):
+    """双侧 bootstrap p 值：2 × min(P(Δ≤0), P(Δ≥0))，下限截断到 1/n_boot"""
+    s = np.asarray([v for v in samples if np.isfinite(v)], dtype=float)
+    if s.size < 20:
+        return np.nan
+    p = 2 * min(float(np.mean(s <= 0)), float(np.mean(s >= 0)))
+    return float(min(1.0, max(p, 1.0 / s.size)))
+
+
+def _incr_paired_bootstrap(y, p_base, p_new, threshold,
+                           n_boot=None, seed=INCR_SEED):
+    """
+    【配对】分层 bootstrap：同一次重采样同时计算 base 与 new 的全套指标，
+    再取差值 → 这是 Δ 指标 95% CI 的唯一正确算法。
+
+    返回 (abs_summary, delta_summary, delta_samples)
+      abs_summary   : {model: {metric: (点估计, lo, hi)}}
+      delta_summary : {metric: {'delta','lo','hi','p'}}
+      delta_samples : {metric: ndarray}  ← 供 S5 的 bootstrap 分布图使用
+    """
+    n_boot = n_boot or INCR_N_BOOT
+    y = np.asarray(y, dtype=int)
+    p_base = np.asarray(p_base, dtype=float)
+    p_new = np.asarray(p_new, dtype=float)
+
+    point_base = _incr_metric_battery(y, p_base, threshold, full=True)
+    point_new = _incr_metric_battery(y, p_new, threshold, full=True)
+
+    b_s = {m: [] for m in _INCR_BOOT_METRICS}
+    n_s = {m: [] for m in _INCR_BOOT_METRICS}
+    d_s = {m: [] for m in _INCR_BOOT_METRICS}
+
+    for idx in _incr_boot_indices(y, n_boot, seed):
+        yb = y[idx]
+        if yb.sum() < 2 or (len(yb) - yb.sum()) < 2:
+            continue
+        try:
+            mb = _incr_metric_battery(yb, p_base[idx], threshold)
+            mn = _incr_metric_battery(yb, p_new[idx], threshold)
+        except Exception:
+            continue
+        for m in _INCR_BOOT_METRICS:
+            b_s[m].append(mb[m]); n_s[m].append(mn[m]); d_s[m].append(mn[m] - mb[m])
+
+    abs_summary = {'base': {}, 'new': {}}
+    for m in _INCR_BOOT_METRICS:
+        lo_b, hi_b = _incr_pct_ci(b_s[m])
+        lo_n, hi_n = _incr_pct_ci(n_s[m])
+        abs_summary['base'][m] = (point_base[m], lo_b, hi_b)
+        abs_summary['new'][m] = (point_new[m], lo_n, hi_n)
+
+    delta_summary = {}
+    delta_samples = {}
+    for m in _INCR_BOOT_METRICS:
+        lo, hi = _incr_pct_ci(d_s[m])
+        delta_summary[m] = {
+            'delta': point_new[m] - point_base[m],
+            'lo': lo, 'hi': hi, 'p': _incr_boot_p(d_s[m]),
+            'n_boot_used': len(d_s[m]),
+        }
+        delta_samples[m] = np.asarray(d_s[m], dtype=float)
+
+    return abs_summary, delta_summary, delta_samples, point_base, point_new
+
+
+def _incr_nri_idi(y, p_old, p_new, threshold, n_boot=None, seed=INCR_SEED):
+    """
+    重分类指标：连续 NRI（cfNRI）、锁定阈值下的分类 NRI、IDI。
+    点估计公式与「术中特征敏感性分析.py」一致；CI 改用与 Δ 指标同源的
+    配对分层 bootstrap（比解析 SE 更稳健，且与本表其它 CI 口径统一）。
+    """
+    n_boot = n_boot or INCR_N_BOOT
+    y = np.asarray(y, dtype=int)
+    po = np.asarray(p_old, dtype=float)
+    pn = np.asarray(p_new, dtype=float)
+
+    def _core(yy, a, b):
+        ev, ne = yy == 1, yy == 0
+        n_ev, n_ne = ev.sum(), ne.sum()
+        if n_ev == 0 or n_ne == 0:
+            return {k: np.nan for k in
+                    ['cfNRI', 'cfNRI_ev', 'cfNRI_ne', 'catNRI', 'catNRI_ev',
+                     'catNRI_ne', 'IDI', 'IDI_ev', 'IDI_ne']}
+        # 连续 NRI
+        cf_ev = (np.sum(b[ev] > a[ev]) - np.sum(b[ev] < a[ev])) / n_ev
+        cf_ne = (np.sum(b[ne] < a[ne]) - np.sum(b[ne] > a[ne])) / n_ne
+        # 分类 NRI（单一锁定切点）
+        ca, cb = (a >= threshold).astype(int), (b >= threshold).astype(int)
+        ct_ev = (np.sum(cb[ev] > ca[ev]) - np.sum(cb[ev] < ca[ev])) / n_ev
+        ct_ne = (np.sum(cb[ne] < ca[ne]) - np.sum(cb[ne] > ca[ne])) / n_ne
+        # IDI
+        idi_ev = float(np.mean(b[ev]) - np.mean(a[ev]))
+        idi_ne = float(np.mean(b[ne]) - np.mean(a[ne]))
+        return {'cfNRI': cf_ev + cf_ne, 'cfNRI_ev': cf_ev, 'cfNRI_ne': cf_ne,
+                'catNRI': ct_ev + ct_ne, 'catNRI_ev': ct_ev, 'catNRI_ne': ct_ne,
+                'IDI': idi_ev - idi_ne, 'IDI_ev': idi_ev, 'IDI_ne': idi_ne}
+
+    point = _core(y, po, pn)
+    keys = list(point.keys())
+    boots = {k: [] for k in keys}
+    for idx in _incr_boot_indices(y, n_boot, seed):
+        r = _core(y[idx], po[idx], pn[idx])
+        for k in keys:
+            boots[k].append(r[k])
+
+    out = {}
+    for k in keys:
+        lo, hi = _incr_pct_ci(boots[k])
+        out[k] = {'value': point[k], 'lo': lo, 'hi': hi, 'p': _incr_boot_p(boots[k])}
+
+    # 重分类计数表（锁定阈值，供正文/附表引用）
+    ev, ne = y == 1, y == 0
+    ca, cb = (po >= threshold).astype(int), (pn >= threshold).astype(int)
+    out['_counts'] = {
+        'events_up': int(np.sum(cb[ev] > ca[ev])), 'events_down': int(np.sum(cb[ev] < ca[ev])),
+        'nonevents_up': int(np.sum(cb[ne] > ca[ne])), 'nonevents_down': int(np.sum(cb[ne] < ca[ne])),
+        'n_events': int(ev.sum()), 'n_nonevents': int(ne.sum()),
+    }
+    return out
+
+
+# ==========================================================================================
+# 10.2 数据装载 —— 逐样本概率与术中变量原始值（只读盘，不重训主流水线）
+# ==========================================================================================
+def _incr_load_framework_A():
+    """
+    Framework A（联合，主分析）：术前模型 vs 术前+术中模型，
+    两者均由「术中特征敏感性分析.py」用【与主模型完全相同】的流水线训练得到，
+    逐样本概率直接读 NRI_Comparison_Data_*.pkl。
+
+    返回 dict 或 None。
+      train 概率优先为 OOF（包内 metadata.train_data_source 会标明）。
+    """
+    path = (f"{DATA_PATH}/NRI_Comparison_Data_{TIMESTAMP_INTRA}.pkl"
+            if os.path.exists(f"{DATA_PATH}/NRI_Comparison_Data_{TIMESTAMP_INTRA}.pkl")
+            else _find_latest(f"{DATA_PATH}/NRI_Comparison_Data_*.pkl"))
+    if not path:
+        print("  ℹ️ 未找到 NRI_Comparison_Data_*.pkl → 跳过 Framework A（全流水线重训的联合模型）")
+        return None
+    try:
+        pkg = joblib.load(path)
+    except Exception as e:
+        print(f"  ⚠️ 读取 {os.path.basename(path)} 失败: {e}")
+        return None
+
+    meta = pkg.get('metadata', {}) or {}
+    src = meta.get('train_data_source', 'unknown')
+    if src != 'OOF':
+        print(f"  ⚠️ 该包的开发队列概率来源为 '{src}' 而非 OOF；"
+              f"Framework A 的开发队列 Δ 会带乐观偏倚，已在 CSV 中标注")
+
+    out = {
+        'y_dev': np.asarray(pkg['y_train'], dtype=int),
+        'y_ext': np.asarray(pkg['y_external'], dtype=int),
+        'p_dev_base': np.asarray(pkg['preop_model']['prob_train'], dtype=float),
+        'p_dev_new': np.asarray(pkg['intraop_model']['prob_train'], dtype=float),
+        'p_ext_base': np.asarray(pkg['preop_model']['prob_external'], dtype=float),
+        'p_ext_new': np.asarray(pkg['intraop_model']['prob_external'], dtype=float),
+        'thr_base': float(pkg['preop_model'].get('threshold', clinical_threshold)),
+        'thr_new': float(pkg['intraop_model'].get('threshold', clinical_threshold)),
+        'dev_source': src,
+        'preop_model_name': meta.get('preop_model_name', best_model_name),
+        'intraop_model_name': meta.get('intraop_model_name', 'N/A'),
+        'source_file': os.path.basename(path),
+    }
+    print(f"  ✓ Framework A 概率来源: {out['source_file']}"
+          f"（开发队列={src}；术前={out['preop_model_name']}，"
+          f"术前+术中={out['intraop_model_name']}）")
+    return out
+
+
+def _incr_load_intraop_frames():
+    """
+    Framework B 需要术中变量的【原始值】。按优先级检索：
+      1) Sensitivity_Model_Package_*.pkl → datasets{X_train, X_ext}（含术前+术中全部列）
+      2) 建模用的原始 CSV（当前目录或 DATA_PATH 下）
+    返回 (df_dev, df_ext, source_str) 或 (None, None, None)
+    """
+    # ---- 路径 1：敏感性分析数据包 ----
+    for cand in [f"{DATA_PATH}/Sensitivity_Model_Package_{TIMESTAMP_INTRA}.pkl",
+                 f"{DATA_PATH}/Sensitivity_Model_Package_latest.pkl",
+                 _find_latest(f"{DATA_PATH}/Sensitivity_Model_Package_*.pkl")]:
+        if not cand or not os.path.exists(cand):
+            continue
+        try:
+            pkg = joblib.load(cand)
+            ds = pkg.get('datasets', {}) or {}
+            d_dev, d_ext = ds.get('X_train', None), ds.get('X_ext', None)
+            if d_dev is not None and d_ext is not None and \
+               all(v in d_dev.columns for v in INCR_VARS):
+                print(f"  ✓ 术中变量原始值来源: {os.path.basename(cand)}")
+                return d_dev.reset_index(drop=True), d_ext.reset_index(drop=True), \
+                    os.path.basename(cand)
+        except Exception as e:
+            print(f"  ⚠️ 读取 {os.path.basename(cand)} 失败: {e}")
+
+    # ---- 路径 2：原始 CSV ----
+    for dev_name, ext_name in [('Internal_setA_NaN2.csv', 'External_setA_NaN3.csv')]:
+        for base in ['.', DATA_PATH]:
+            pd_dev, pd_ext = os.path.join(base, dev_name), os.path.join(base, ext_name)
+            if os.path.exists(pd_dev) and os.path.exists(pd_ext):
+                try:
+                    d_dev = pd.read_csv(pd_dev, index_col=0)
+                    d_ext = pd.read_csv(pd_ext, index_col=0)
+                    d_dev = d_dev.dropna(subset=['Recurrence']).reset_index(drop=True)
+                    d_ext = d_ext.dropna(subset=['Recurrence']).reset_index(drop=True)
+                    if all(v in d_dev.columns for v in INCR_VARS):
+                        print(f"  ✓ 术中变量原始值来源: {pd_dev} / {pd_ext}")
+                        return d_dev, d_ext, f'{dev_name} + {ext_name}'
+                except Exception as e:
+                    print(f"  ⚠️ 读取原始 CSV 失败: {e}")
+
+    print("  ℹ️ 未找到含术中变量的原始数据 → 跳过 Framework B（逐项加入分析）")
+    return None, None, None
+
+
+def _incr_check_alignment(y_ref, y_cand, tag):
+    """行序/样本对齐校验：长度一致且标签逐例相同才认为可以放心比较"""
+    y_ref = np.asarray(y_ref, dtype=int)
+    y_cand = np.asarray(y_cand, dtype=int)
+    if len(y_ref) != len(y_cand):
+        print(f"  ⚠️ {tag}: 样本量不一致（{len(y_ref)} vs {len(y_cand)}），已跳过该比较")
+        return False
+    if not np.array_equal(y_ref, y_cand):
+        n_diff = int((y_ref != y_cand).sum())
+        print(f"  ⚠️ {tag}: 结局标签有 {n_diff} 例不一致（行序可能错位），已跳过该比较")
+        return False
+    return True
+
+
+# ==========================================================================================
+# 10.3 Framework B —— 以术前模型线性预测值为锚的增量 logistic 回归
+#      baseline : logit(p_preop)
+#      extended : logit(p_preop) + 候选术中变量
+#   · 开发队列：重复分层 5 折 CV（×20）的 out-of-fold 预测（缺失填补与标准化【折内】完成）
+#   · 外部队列：系数在整个开发队列锁定后直接应用，无任何外部信息回流
+# ==========================================================================================
+def _incr_build_Z(df_dev, df_ext, varlist):
+    """
+    生成候选变量设计矩阵（仅做必要的编码，缺失/标准化留到折内）。
+      · 数值型（唯一值 > 2）→ 保留原列，后续按折内均值/标准差标准化（OR 解释为 per 1 SD）
+      · 二分类（唯一值 ≤ 2）→ 保留 0/1，不标准化（OR 解释为 1 vs 0）
+      · 字符型/多分类       → 按开发集水平做哑变量（drop-first）
+    返回 (Z_dev, Z_ext, colnames, is_binary, unit_note)
+    """
+    Zd, Ze, names, is_bin, units = [], [], [], [], []
+    for v in varlist:
+        s_d, s_e = df_dev[v], df_ext[v]
+        if pd.api.types.is_numeric_dtype(s_d):
+            x_d = pd.to_numeric(s_d, errors='coerce').astype(float).values
+            x_e = pd.to_numeric(s_e, errors='coerce').astype(float).values
+            uniq = np.unique(x_d[~np.isnan(x_d)])
+            binary = uniq.size <= 2
+            Zd.append(x_d); Ze.append(x_e); names.append(v)
+            is_bin.append(binary)
+            if binary:
+                units.append('per 1 unit (yes vs no)')
+            else:
+                sd = float(np.nanstd(x_d))
+                units.append(f'per 1 SD ({sd:.3g} {("min" if "Duration" in v else "unit")})')
         else:
-            colors.append('#e74c3c')
+            levels = sorted(pd.Series(s_d.dropna().astype(str)).unique())[1:]
+            for lv in levels:
+                Zd.append((s_d.astype(str) == lv).astype(float).values)
+                Ze.append((s_e.astype(str) == lv).astype(float).values)
+                names.append(f'{v}={lv}')
+                is_bin.append(True)
+                units.append(f'level "{lv}" vs reference')
+    if not names:
+        return None, None, [], None, []
+    return (np.column_stack(Zd), np.column_stack(Ze), names,
+            np.asarray(is_bin, dtype=bool), units)
 
-    y_pos = np.arange(len(data))
-    ax.hlines(y=y_pos, xmin=0, xmax=data['Selection_Freq'],
-              color='gray', alpha=0.4, linewidth=1.2)
-    ax.scatter(data['Selection_Freq'], y_pos,
-               color=colors, s=60, alpha=0.85,
-               edgecolors='white', linewidth=0.8, zorder=4)
 
-    for i, (freq, count, total) in enumerate(zip(
-            data['Selection_Freq'], data['Selection_Count'], data['Total_Folds'])):
-        ax.text(freq + 0.05, i, f'{freq:.1%}',
-                va='center', fontsize=7)
+def _incr_transform(Z_fit, Z_apply_list, is_bin):
+    """
+    折内预处理：中位数填补 + 连续变量标准化（统计量只用 Z_fit 估计，杜绝泄露）。
+    Z_apply_list 为需要用同一组统计量变换的矩阵列表。
+    """
+    med = np.nanmedian(Z_fit, axis=0)
+    med = np.where(np.isnan(med), 0.0, med)
+    Zf = np.where(np.isnan(Z_fit), med, Z_fit)
 
-    ax.axvline(x=0.8, color='green', linestyle='--', alpha=0.3, label='High Stability (80%)')
-    ax.axvline(x=0.5, color='orange', linestyle='--', alpha=0.3, label='Medium Stability (50%)')
+    mu = np.where(is_bin, 0.0, Zf.mean(axis=0))
+    sd = np.where(is_bin, 1.0, Zf.std(axis=0))
+    sd = np.where(sd < 1e-12, 1.0, sd)
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(data['Feature'], fontsize=10)
-    ax.set_xlabel('LASSO Selection Frequency')
-    ax.set_xlim(0, 1.15)
+    outs = []
+    for Z in Z_apply_list:
+        Za = np.where(np.isnan(Z), med, Z)
+        outs.append((Za - mu) / sd)
+    return (Zf - mu) / sd, outs
+
+
+def _incr_fit_framework_B(lp_dev, Z_dev, y_dev, lp_ext, Z_ext, is_bin, colnames,
+                          cv_folds=INCR_CV_FOLDS, cv_repeats=INCR_CV_REPEATS,
+                          seed=INCR_SEED):
+    """
+    返回 dict:
+      oof_base / oof_new : 开发队列 out-of-fold 预测概率（重复 CV 取均值）
+      ext_base / ext_new : 外部队列预测概率（开发队列锁定系数）
+      coef_rows          : 候选变量的调整后 OR (95% CI) 与 Wald p
+      lrt                : 似然比检验 {chi2, df, p}
+    """
+    y_dev = np.asarray(y_dev, dtype=int)
+    n = len(y_dev)
+    oof_base = np.zeros(n); oof_new = np.zeros(n); cnt = np.zeros(n)
+
+    rskf = RepeatedStratifiedKFold(n_splits=cv_folds, n_repeats=cv_repeats,
+                                   random_state=seed)
+    for tr, te in rskf.split(np.zeros(n), y_dev):
+        # --- baseline：只含锚定的术前线性预测值 ---
+        Xtr_b = np.column_stack([np.ones(len(tr)), lp_dev[tr]])
+        Xte_b = np.column_stack([np.ones(len(te)), lp_dev[te]])
+        beta_b, _, _, _ = _incr_irls(Xtr_b, y_dev[tr])
+        oof_base[te] += expit(np.clip(Xte_b @ beta_b, -35, 35))
+
+        # --- extended：锚 + 候选术中变量（折内填补/标准化）---
+        Ztr, (Zte,) = _incr_transform(Z_dev[tr], [Z_dev[te]], is_bin)
+        Xtr_e = np.column_stack([np.ones(len(tr)), lp_dev[tr], Ztr])
+        Xte_e = np.column_stack([np.ones(len(te)), lp_dev[te], Zte])
+        beta_e, _, _, _ = _incr_irls(Xtr_e, y_dev[tr])
+        oof_new[te] += expit(np.clip(Xte_e @ beta_e, -35, 35))
+
+        cnt[te] += 1
+
+    cnt = np.where(cnt == 0, 1, cnt)
+    oof_base /= cnt
+    oof_new /= cnt
+
+    # ---- 全开发队列锁定系数 → 外部队列 ----
+    Z_dev_t, (Z_ext_t,) = _incr_transform(Z_dev, [Z_ext], is_bin)
+
+    Xd_b = np.column_stack([np.ones(n), lp_dev])
+    Xd_e = np.column_stack([np.ones(n), lp_dev, Z_dev_t])
+    beta_b, cov_b, ll_b, _ = _incr_irls(Xd_b, y_dev)
+    beta_e, cov_e, ll_e, _ = _incr_irls(Xd_e, y_dev)
+
+    ext_base = ext_new = None
+    if lp_ext is not None and Z_ext_t is not None and len(lp_ext) > 0:
+        Xe_b = np.column_stack([np.ones(len(lp_ext)), lp_ext])
+        Xe_e = np.column_stack([np.ones(len(lp_ext)), lp_ext, Z_ext_t])
+        ext_base = expit(np.clip(Xe_b @ beta_b, -35, 35))
+        ext_new = expit(np.clip(Xe_e @ beta_e, -35, 35))
+
+    # ---- 候选变量的调整后 OR 与 Wald 检验 ----
+    coef_rows = []
+    se_e = np.sqrt(np.clip(np.diag(cov_e), 0, None))
+    for j, nm in enumerate(colnames):
+        k = 2 + j                                  # 0=截距, 1=锚定 LP
+        b, s = float(beta_e[k]), float(se_e[k])
+        z = b / s if s > 0 else np.nan
+        coef_rows.append({
+            'Variable_code': nm,
+            'Variable': rename_feature(nm),
+            'Beta': b, 'SE': s,
+            'OR': float(np.exp(b)),
+            'OR_CI_lo': float(np.exp(b - 1.96 * s)),
+            'OR_CI_hi': float(np.exp(b + 1.96 * s)),
+            'z': z,
+            'Wald_p': float(2 * (1 - _norm.cdf(abs(z)))) if np.isfinite(z) else np.nan,
+        })
+
+    # ---- 似然比检验：extended vs baseline（开发队列，自由度=新增变量数）----
+    lrt_chi2 = float(2 * (ll_e - ll_b))
+    lrt_df = int(len(colnames))
+    lrt_p = float(1 - _chi2.cdf(max(lrt_chi2, 0.0), lrt_df)) if lrt_df > 0 else np.nan
+
+    return {
+        'oof_base': oof_base, 'oof_new': oof_new,
+        'ext_base': ext_base, 'ext_new': ext_new,
+        'coef_rows': coef_rows,
+        'lrt': {'chi2': lrt_chi2, 'df': lrt_df, 'p': lrt_p},
+        'anchor_beta': float(beta_e[1]),
+        'n_dev': n,
+    }
+
+
+# ==========================================================================================
+# 10.4 S5 专用绘图函数（沿用本脚本的单面板 SCI 风格）
+# ==========================================================================================
+def _incr_nice_ticks(lo, hi, n=5):
+    """在 [lo, hi] 内取整齐刻度（避免 matplotlib 自动刻度侵入右侧注释列）"""
+    from matplotlib.ticker import MaxNLocator
+    t = MaxNLocator(nbins=n, steps=[1, 2, 2.5, 5, 10]).tick_values(lo, hi)
+    return [v for v in t if lo - 1e-12 <= v <= hi + 1e-12]
+
+
+def plot_delta_forest(rows, save_path, xlabel='Δ (with intraoperative − without)',
+                      figsize=None, rope=None, rope_panels=None, title_note=None,
+                      value_fmt='{:+.4f}', annot_header='Δ (95% CI), p',
+                      record_tag=None):
+    """
+    Δ 指标森林图（本脚本风格）。
+
+      · 竖直零线 = 无增量；点 + 95% CI；CI 跨过零线 → 空心点，不跨 → 实心点，
+        一眼分辨「确定的差异」与「与 0 无法区分」；
+      · 右侧独立注释列写出 Δ (95% CI) 与 p，点再密也不会与数字重叠；
+      · 可选 ROPE 淡色带（临床可忽略区间），支撑「未显示明确增量价值」的表述；
+      · rows 可带 'panel' 键：不同 panel 各自独立 x 轴 —— 这一点很关键，
+        ΔAUROC（≈0.001 量级）与 Δ校准斜率（≈0.1 量级）若共用一根横轴，
+        前者会被压成一个点，图就没有信息量了。
+
+    rows : list of dict(label=…, cohort=…, delta=…, lo=…, hi=…, p=…, panel=…)
+    """
+    rows = [r for r in rows if np.isfinite(r.get('delta', np.nan))]
+    if not rows:
+        print("  ⚠️ 无可绘制的 Δ 数据，跳过")
+        return None
+
+    # ---- 分组：panel（独立 x 轴） / label（y 行） / cohort（同行 dodge）----
+    panels = []
+    for r in rows:
+        r.setdefault('panel', 'main')
+        if r['panel'] not in panels:
+            panels.append(r['panel'])
+    cohorts = []
+    for r in rows:
+        if r['cohort'] not in cohorts:
+            cohorts.append(r['cohort'])
+
+    panel_rows = {pn: [r for r in rows if r['panel'] == pn] for pn in panels}
+    panel_labels = {}
+    for pn in panels:
+        labs = []
+        for r in panel_rows[pn]:
+            if r['label'] not in labs:
+                labs.append(r['label'])
+        panel_labels[pn] = labs
+
+    n_all = sum(len(panel_labels[pn]) for pn in panels)
+    if figsize is None:
+        figsize = (5.6, max(2.6, 0.46 * n_all + 0.55 * len(panels) + 1.1))
+
+    fig = plt.figure(figsize=figsize)
+    gs = gridspec.GridSpec(len(panels), 1,
+                           height_ratios=[len(panel_labels[pn]) + 0.35 for pn in panels],
+                           hspace=0.42)
+    offs_all = np.linspace(0.19, -0.19, len(cohorts)) if len(cohorts) > 1 else np.array([0.0])
+
+    axes = []
+    for pi, pn in enumerate(panels):
+        ax = fig.add_subplot(gs[pi])
+        axes.append(ax)
+        labels = panel_labels[pn]
+        n_row = len(labels)
+        prs = panel_rows[pn]
+
+        # ---- x 轴范围：数据区 + 右侧注释列 ----
+        vals = [0.0]
+        for r in prs:
+            vals += [r['delta'],
+                     r['lo'] if np.isfinite(r.get('lo', np.nan)) else r['delta'],
+                     r['hi'] if np.isfinite(r.get('hi', np.nan)) else r['delta']]
+        show_rope = (rope is not None and (rope_panels is None or pn in rope_panels))
+        if show_rope:
+            vals += [rope[0] * 1.18, rope[1] * 1.18]
+        d_lo, d_hi = float(np.min(vals)), float(np.max(vals))
+        span = max(d_hi - d_lo, 1e-9)
+        d_lo -= span * 0.08
+        d_hi += span * 0.08
+        data_span = d_hi - d_lo
+        ax.set_xlim(d_lo, d_hi + data_span * 0.68)          # 右 68% 留给注释列
+
+        # ---- ROPE 带 ----
+        if show_rope:
+            ax.axvspan(rope[0], rope[1], color='#BBBBBB', alpha=0.13, zorder=0, lw=0)
+            for xv in rope:
+                ax.axvline(xv, color='#AAAAAA', ls=':', lw=0.7, alpha=0.9, zorder=1)
+
+        ax.axvline(0.0, color='#333333', ls='--', lw=0.9, alpha=0.85, zorder=1)
+        ax.axvline(d_hi, color='#DDDDDD', lw=0.7, alpha=0.9, zorder=1)   # 数据区/注释列分隔
+
+        for ci, co in enumerate(cohorts):
+            col = INCR_COHORT_COLOR.get(co, COLORS_LIST[ci % len(COLORS_LIST)])
+            mk = INCR_COHORT_MARK.get(co, 'o')
+            for r in [x for x in prs if x['cohort'] == co]:
+                yi = n_row - 1 - labels.index(r['label']) + offs_all[ci]
+                lo = r['lo'] if np.isfinite(r.get('lo', np.nan)) else r['delta']
+                hi = r['hi'] if np.isfinite(r.get('hi', np.nan)) else r['delta']
+                lo_c, hi_c = max(lo, d_lo), min(hi, d_hi)
+                crosses_zero = (lo <= 0 <= hi)
+
+                ax.plot([lo_c, hi_c], [yi, yi], color=col, lw=1.0, alpha=0.9,
+                        solid_capstyle='butt', zorder=3)
+                for xcap, inside in ((lo_c, lo >= d_lo), (hi_c, hi <= d_hi)):
+                    if inside:
+                        ax.plot([xcap, xcap], [yi - 0.055, yi + 0.055], color=col,
+                                lw=0.9, alpha=0.9, zorder=3)
+                ax.plot([r['delta']], [yi], marker=mk, ms=4.2,
+                        markerfacecolor=('white' if crosses_zero else col),
+                        markeredgecolor=col, markeredgewidth=1.0, ls='none', zorder=4)
+
+                # ---- 右侧注释列：Δ (95% CI), p ----
+                txt = value_fmt.format(r['delta'])
+                if np.isfinite(r.get('lo', np.nan)) and np.isfinite(r.get('hi', np.nan)):
+                    txt += (' (' + value_fmt.format(r['lo']).lstrip('+') + ' to '
+                            + value_fmt.format(r['hi']).lstrip('+') + ')')
+                if np.isfinite(r.get('p', np.nan)):
+                    txt += f', p={_fmt_p(r["p"])}'
+                ax.text(d_hi + data_span * 0.03, yi, txt, ha='left', va='center',
+                        fontsize=5.6, color=col, zorder=5)
+
+        ax.set_yticks(np.arange(n_row)[::-1])
+        ax.set_yticklabels(labels)
+        ax.set_ylim(-0.62, n_row - 0.34)
+        ax.set_xticks(_incr_nice_ticks(d_lo, d_hi))
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.13, linewidth=0.5)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis='y', length=0)
+
+        head = pn if len(panels) > 1 else (title_note or '')
+        if head:
+            ax.text(0.0, 1.05, head, transform=ax.transAxes, fontsize=6.8,
+                    color='#555555', va='bottom', ha='left', fontstyle='italic')
+        if annot_header:
+            ax.text(d_hi + data_span * 0.03, n_row - 0.30, annot_header,
+                    ha='left', va='center', fontsize=5.8, color='#888888')
+        if pi == len(panels) - 1:
+            ax.set_xlabel(xlabel)
+
+    if len(panels) > 1 and title_note:
+        axes[0].set_title(title_note, fontsize=7, color='#555555', loc='left', pad=16)
+
+    # ---- 统一图例（置于最后一个 panel 下方，绝不遮挡数据）----
+    handles = [Line2D([0], [0], marker=INCR_COHORT_MARK.get(c, 'o'),
+                      color=INCR_COHORT_COLOR.get(c, '#333333'),
+                      markerfacecolor=INCR_COHORT_COLOR.get(c, '#333333'),
+                      markeredgecolor=INCR_COHORT_COLOR.get(c, '#333333'),
+                      ms=4.2, lw=1.0, label=c) for c in cohorts]
+    handles.append(Line2D([0], [0], marker='o', ls='none', ms=4.2,
+                          markerfacecolor='white', markeredgecolor='#666666',
+                          label='95% CI includes 0'))
+    if rope is not None:
+        handles.append(Rectangle((0, 0), 1, 1, facecolor='#BBBBBB', alpha=0.35,
+                                 edgecolor='none',
+                                 label=f'Negligible range (±{abs(rope[1]):g})'))
+    sci_legend(axes[-1], handles=handles, loc='upper center',
+               bbox_to_anchor=(0.5, -0.30), ncol=min(len(handles), 4), fontsize=6.0,
+               columnspacing=1.1)
+
+    plt.tight_layout()
+    _supp_save(save_path)
+    return fig
+
+
+def plot_incr_roc_compare(y, p_base, p_new, label_base, label_new, save_path,
+                          note=None, figsize=(3.6, 3.6), record_tag=None):
+    """两模型 ROC 叠加 + DeLong 检验（同一批患者的两套预测 → 必须用相关 ROC 方法）"""
+    y = np.asarray(y, dtype=int)
+    d = delong_roc_test(y, p_base, p_new)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for p, lab, col, auc, lo, hi in [
+            (p_base, label_base, INCR_MODEL_COLOR['base'],
+             d['AUROC_base'], d['AUROC_base_lo'], d['AUROC_base_hi']),
+            (p_new, label_new, INCR_MODEL_COLOR['new'],
+             d['AUROC_new'], d['AUROC_new_lo'], d['AUROC_new_hi'])]:
+        fpr, tpr, _ = roc_curve(y, np.asarray(p, dtype=float))
+        ax.plot(fpr, tpr, color=col, lw=1.5, alpha=0.9,
+                label=f'{lab} (AUROC = {auc:.3f}, 95% CI {lo:.3f}–{hi:.3f})')
+
+    ax.plot([0, 1], [0, 1], color='#999999', lw=0.8, ls='--', zorder=1)
+
+    # 队列信息与 Δ 统计合并进同一个方框，避免与曲线重叠
+    box = (note.replace('\n', ' · ') + '\n' if note else '')
+    box += (f"ΔAUROC = {d['Delta_AUROC']:+.3f}\n"
+            f"95% CI {d['CI_lo']:+.3f} to {d['CI_hi']:+.3f}\n"
+            f"DeLong p = {_fmt_p(d['p_value'])}")
+    ax.text(0.97, 0.05, box, transform=ax.transAxes, fontsize=6.2,
+            va='bottom', ha='right', color='#333333', linespacing=1.35,
+            bbox=dict(boxstyle='square,pad=0.35', facecolor='white',
+                      edgecolor='#999999', linewidth=0.6))
+
+    ax.set_xlabel('1 − Specificity')
+    ax.set_ylabel('Sensitivity')
+    ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.02])
+    ax.set_aspect('equal')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    sci_legend(ax, loc='lower right')
-    ax.grid(axis='x', alpha=0.15, linewidth=0.5)
+    sci_legend(ax, loc='upper center', bbox_to_anchor=(0.5, -0.20), fontsize=6.0)
+
+    _SUPP_STATS_ROWS.append({
+        'Figure': record_tag or os.path.basename(save_path),
+        'Series': f'{label_new} vs {label_base}', 'N': len(y), 'Events': int(y.sum()),
+        'AUROC_base': d['AUROC_base'], 'AUROC_extended': d['AUROC_new'],
+        'Delta_AUROC': d['Delta_AUROC'], 'Delta_AUROC_CI_lo': d['CI_lo'],
+        'Delta_AUROC_CI_hi': d['CI_hi'], 'DeLong_p': d['p_value'],
+    })
 
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.close()
-
-# 为三个场景各画一张棒棒糖图
-for label, cfg in SCENARIOS.items():
-    df_sub = cfg['freq_df']
-    df_sub = df_sub[df_sub['Model'] == cfg['best_model']].copy()
-    df_sub = df_sub.sort_values('Selection_Freq', ascending=True)
-    safe = label.replace(' ', '_')
-    plot_lollipop_chart(df_sub, cfg['best_model'],
-                        title_suffix=f'{label}',
-                        save_path=f'figures/LASSO_Lollipop_{safe}.png')
-    print(f"✅ Lollipop saved: {label}")
+    _supp_save(save_path)
+    return fig, d
 
 
-# ============================================================
-# 图2: 热力图 - 三场景特征选择频率对比
-# ============================================================
-scenario_series = {}
-for label, cfg in SCENARIOS.items():
-    df_sub = cfg['freq_df']
-    df_sub = df_sub[df_sub['Model'] == cfg['best_model']].copy()
-    scenario_series[label] = df_sub.set_index('Feature')['Selection_Freq']
+def plot_incr_pr_compare(y, p_base, p_new, label_base, label_new, save_path,
+                         note=None, figsize=(3.6, 3.6), record_tag=None):
+    """两模型 PR 曲线叠加 —— 事件率较低时，AP 对增量比 AUROC 更敏感"""
+    y = np.asarray(y, dtype=int)
+    fig, ax = plt.subplots(figsize=figsize)
+    aps = {}
+    for p, lab, col in [(p_base, label_base, INCR_MODEL_COLOR['base']),
+                        (p_new, label_new, INCR_MODEL_COLOR['new'])]:
+        p = np.asarray(p, dtype=float)
+        prec, rec, _ = precision_recall_curve(y, p)
+        ap = float(average_precision_score(y, p))
+        aps[lab] = ap
+        ax.plot(rec, prec, color=col, lw=1.5, alpha=0.9, label=f'{lab} (AP = {ap:.3f})')
 
-freq_wide = pd.DataFrame(scenario_series).fillna(0)
-freq_wide = freq_wide.sort_values('Original Preop Model', ascending=True)
+    prev = float(y.mean())
+    ax.axhline(prev, color='#999999', ls=':', lw=0.8, label=f'Prevalence = {prev:.3f}')
 
-def plot_feature_heatmap(data, save_path=None):
-    fig, ax = plt.subplots(figsize=(5, max(6, len(data) * 0.35)))
-    im = ax.imshow(data.values, aspect='auto', cmap=plt.cm.Blues, vmin=0, vmax=1)
+    box = (note.replace('\n', ' · ') + '\n' if note else '')
+    box += f'ΔAP = {aps[label_new] - aps[label_base]:+.3f}'
+    ax.text(0.03, 0.04, box, transform=ax.transAxes, fontsize=6.2,
+            va='bottom', ha='left', color='#333333', linespacing=1.35,
+            bbox=dict(boxstyle='square,pad=0.35', facecolor='white',
+                      edgecolor='#999999', linewidth=0.6))
 
-    for i in range(data.shape[0]):
-        for j in range(data.shape[1]):
-            val = data.values[i, j]
-            color = 'white' if val > 0.65 else 'black'
-            ax.text(j, i, f'{val:.0%}', ha='center', va='center',
-                    fontsize=8, color=color)
-
-    ax.set_xticks(np.arange(data.shape[1]))
-    ax.set_xticklabels(data.columns, fontsize=8, rotation=30, ha='right')
-    ax.set_yticks(np.arange(data.shape[0]))
-    ax.set_yticklabels(data.index, fontsize=8)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
-    cbar.set_label('Selection Frequency', fontsize=8)
-    cbar.ax.tick_params(labelsize=7)
-    # ax.set_title('LASSO Feature Selection Across Scenarios', fontsize=10, pad=12)
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_xlim([-0.02, 1.02]); ax.set_ylim([-0.02, 1.05])
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    sci_legend(ax, loc='upper right', fontsize=6.2)
 
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.close()
-
-plot_feature_heatmap(freq_wide,
-                     save_path='figures/LASSO_Feature_Heatmap_Compare.png')
-print("✅ Heatmap saved")
+    _supp_save(save_path)
+    return fig
 
 
-# ============================================================
-# 图3: UpSet 风格点阵图 — 各场景共享/独有特征
-# ============================================================
-def plot_dot_matrix(data, threshold=0.5, save_path=None):
-    selected = (data >= threshold).astype(int)
-    selected['Pattern'] = selected.apply(lambda r: tuple(r), axis=1)
-    pattern_groups = selected.groupby('Pattern').apply(lambda g: list(g.index))
-    patterns = sorted(pattern_groups.items(), key=lambda x: -len(x[1]))
-    scenarios = data.columns.tolist()
+def plot_incr_delta_distribution(samples_by_cohort, save_path, metric_label='ΔAUROC',
+                                 figsize=(3.8, 3.0), rope=None, record_tag=None):
+    """
+    配对 bootstrap 的 Δ 分布图：阶梯直方图 + 2.5/97.5 分位竖线 + 零线。
+    回答的是「增量是否稳定地大于 0」，而不是只看一个点估计。
+    """
+    samples_by_cohort = {k: np.asarray(v, dtype=float)
+                         for k, v in samples_by_cohort.items()
+                         if v is not None and len(np.asarray(v)) > 20}
+    if not samples_by_cohort:
+        print("  ⚠️ 无 bootstrap 样本，跳过分布图")
+        return None
 
-    fig, (ax_bar, ax_dot) = plt.subplots(
-        2, 1, figsize=(max(6, len(patterns) * 0.9), 4),
-        gridspec_kw={'height_ratios': [2, 1]}, sharex=True)
+    all_vals = np.concatenate(list(samples_by_cohort.values()))
+    lo_x, hi_x = np.percentile(all_vals, 0.5), np.percentile(all_vals, 99.5)
+    if rope is not None:
+        lo_x, hi_x = min(lo_x, rope[0] * 1.12), max(hi_x, rope[1] * 1.12)
+    pad = (hi_x - lo_x) * 0.10 + 1e-9
+    bins = np.linspace(lo_x - pad, hi_x + pad, 46)
 
-    x = np.arange(len(patterns))
-    counts = [len(feats) for _, feats in patterns]
+    fig, ax = plt.subplots(figsize=figsize)
+    if rope is not None:
+        ax.axvspan(rope[0], rope[1], color='#BBBBBB', alpha=0.13, zorder=0, lw=0)
+        for xv in rope:
+            ax.axvline(xv, color='#AAAAAA', ls=':', lw=0.7, alpha=0.9, zorder=1)
 
-    ax_bar.bar(x, counts, color=COLORS_LIST[3], width=0.55, edgecolor='white')
-    for xi, c in zip(x, counts):
-        ax_bar.text(xi, c + 0.15, str(c), ha='center', va='bottom', fontsize=8)
-    ax_bar.set_ylabel('Feature Count')
-    ax_bar.set_title(f'Feature Overlap Across Scenarios (freq ≥ {threshold:.0%})',
-                     fontsize=10, pad=10)
-    ax_bar.set_ylim(0, max(counts) * 1.25)
+    for co, s in samples_by_cohort.items():
+        col = INCR_COHORT_COLOR.get(co, C_INT)
+        lo, hi = np.percentile(s, [2.5, 97.5])
+        ax.hist(s, bins=bins, histtype='stepfilled', color=col, alpha=0.18, lw=0, zorder=2)
+        ax.hist(s, bins=bins, histtype='step', color=col, lw=1.2, zorder=3,
+                label=f'{co}: {np.median(s):+.3f} ({lo:+.3f} to {hi:+.3f})')
+        for xv in (lo, hi):
+            ax.axvline(xv, color=col, ls=':', lw=0.9, alpha=0.85, zorder=3)
 
-    for i, (pat, _) in enumerate(patterns):
-        for j, val in enumerate(pat):
-            color = COLORS_LIST[0] if val else '#dddddd'
-            ax_dot.scatter(i, j, s=120, color=color, edgecolors='white',
-                           linewidth=0.8, zorder=3)
-        active = [j for j, v in enumerate(pat) if v]
-        if len(active) > 1:
-            ax_dot.plot([i] * len(active), active, color=COLORS_LIST[0],
-                        linewidth=1.5, zorder=2)
-
-    ax_dot.set_yticks(range(len(scenarios)))
-    ax_dot.set_yticklabels(scenarios, fontsize=8)
-    ax_dot.set_xticks([])
-    ax_dot.set_xlim(-0.5, len(patterns) - 0.5)
-    ax_dot.invert_yaxis()
-    ax_dot.spines['bottom'].set_visible(False)
+    ax.axvline(0.0, color='#333333', ls='--', lw=1.0, alpha=0.9, zorder=4)
+    ax.set_xlabel(f'{metric_label} (pre + intraoperative − preoperative)')
+    ax.set_ylabel('Bootstrap resamples')
+    ax.set_xlim(bins[0], bins[-1])
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', alpha=0.13, linewidth=0.5)
+    ax.set_axisbelow(True)
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.45)
+    sci_legend(ax, loc='upper left', fontsize=5.8, title='Median (95% CI)')
 
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.close()
-
-if len(freq_wide.columns) > 1:
-    plot_dot_matrix(freq_wide, threshold=0.5,
-                    save_path='figures/LASSO_Feature_Overlap_Dot.png')
-    print("✅ Dot matrix saved")
+    _supp_save(save_path)
+    return fig
 
 
-# ============================================================
-# 图4: 特征重要性对比图 (Grouped Bar — 三场景)
-# ============================================================
-
-def extract_feature_importance(pkg, freq_df_best):
+def plot_incr_reclass_flow(y, p_base, p_new, threshold, save_path,
+                           figsize=(4.6, 2.6), note=None, record_tag=None):
     """
-    从模型包中提取最佳模型的特征重要性
-    支持: tree-based (.feature_importances_), linear (.coef_)
-    若都不可用，回退到 LASSO 选择频率作为替代
+    锁定阈值下的重分类流向图：事件组 / 非事件组分别统计
+    「上调到高风险」「下调到低风险」「未改变」的比例。
+    真实数据中重分类通常很少（色块极窄），因此右侧同时给出计数注释，
+    保证数字在任何情况下都可读。
     """
-    model = pkg.get('best_model', pkg.get('final_model', None))
-    features = freq_df_best['Feature'].tolist()
+    y = np.asarray(y, dtype=int)
+    ca = (np.asarray(p_base, float) >= threshold).astype(int)
+    cb = (np.asarray(p_new, float) >= threshold).astype(int)
 
-    # tree-based
-    if hasattr(model, 'feature_importances_'):
-        imp = model.feature_importances_
-        # 可能是 pipeline，取最后一步
-        if len(imp) != len(features):
-            # 尝试 pipeline 的最后一步
-            if hasattr(model, 'named_steps'):
-                for step_name in reversed(list(model.named_steps)):
-                    step = model.named_steps[step_name]
-                    if hasattr(step, 'feature_importances_'):
-                        imp = step.feature_importances_
-                        break
-        if len(imp) == len(features):
-            return pd.Series(np.abs(imp), index=features, name='Importance')
+    groups = [('Events', y == 1, C_EXT), ('Non-events', y == 0, C_INT)]
+    fig, ax = plt.subplots(figsize=figsize)
+    ypos, bar_h = np.arange(len(groups))[::-1], 0.46
 
-    # linear
-    if hasattr(model, 'coef_'):
-        coef = np.array(model.coef_).ravel()
-        if len(coef) == len(features):
-            return pd.Series(np.abs(coef), index=features, name='Importance')
+    for gi, (gname, mask, col) in enumerate(groups):
+        n = int(mask.sum())
+        up = int(np.sum(cb[mask] > ca[mask]))
+        dn = int(np.sum(cb[mask] < ca[mask]))
+        same = n - up - dn
+        good_is_up = (gname == 'Events')          # 事件组上调才是有益重分类
 
-    # pipeline 处理
-    if hasattr(model, 'named_steps'):
-        for step_name in reversed(list(model.named_steps)):
-            step = model.named_steps[step_name]
-            if hasattr(step, 'feature_importances_'):
-                imp = step.feature_importances_
-                if len(imp) == len(features):
-                    return pd.Series(np.abs(imp), index=features, name='Importance')
-            if hasattr(step, 'coef_'):
-                coef = np.array(step.coef_).ravel()
-                if len(coef) == len(features):
-                    return pd.Series(np.abs(coef), index=features, name='Importance')
+        segs = [(up, col, 0.85 if good_is_up else 0.28),
+                (same, '#CCCCCC', 0.65),
+                (dn, col, 0.28 if good_is_up else 0.85)]
+        left = 0.0
+        for val, scol, alpha in segs:
+            if n == 0:
+                continue
+            frac = val / n
+            ax.barh(ypos[gi], frac, left=left, height=bar_h, color=scol,
+                    alpha=alpha, edgecolor='white', linewidth=0.5, zorder=3)
+            if frac > 0.10:
+                ax.text(left + frac / 2, ypos[gi], f'{val} ({frac:.0%})',
+                        ha='center', va='center', fontsize=6.0, color='#222222')
+            left += frac
 
-    # 回退：用选择频率代替
-    print("  ⚠️ 无法提取模型系数，回退使用 Selection_Freq")
-    return pd.Series(freq_df_best['Selection_Freq'].values,
-                     index=features, name='Importance')
+        good = up if good_is_up else dn
+        bad = dn if good_is_up else up
+        txt = (f'n = {n}\nCorrect: {good} ({good / n:.1%})\nWrong: {bad} ({bad / n:.1%})'
+               if n else 'n = 0')
+        ax.text(1.03, ypos[gi], txt, ha='left', va='center',
+                fontsize=5.8, color='#444444', linespacing=1.3)
 
+        _INCR_ROWS_RECLASS.append({
+            'Comparison': record_tag or os.path.basename(save_path),
+            'Index': f'Reclassification counts — {gname}',
+            'Index_code': f'reclass_{gname.lower()}',
+            'Value': np.nan, 'CI_lo': np.nan, 'CI_hi': np.nan, 'p_value': np.nan,
+            'CI_method': 'counts at locked threshold',
+            'Threshold': threshold, 'N': n,
+            'Reclassified_up': up, 'Reclassified_down': dn, 'Unchanged': same,
+        })
 
-def plot_importance_comparison(scenarios_cfg, save_path=None):
-    """
-    分组柱状图：对比三个场景中各特征的重要性（归一化到 0-1）
-    """
-    importance_dict = {}
-    for label, cfg in scenarios_cfg.items():
-        df_sub = cfg['freq_df']
-        df_sub = df_sub[df_sub['Model'] == cfg['best_model']].copy()
-        imp = extract_feature_importance(cfg['package'], df_sub)
-        # 归一化
-        if imp.max() > 0:
-            imp = imp / imp.max()
-        importance_dict[label] = imp
+    ax.set_yticks(ypos)
+    ax.set_yticklabels([g[0] for g in groups])
+    ax.set_xlim(0, 1.0)
+    ax.set_ylim(-0.55, len(groups) - 0.45)
+    ax.set_xlabel(f'Proportion reclassified at threshold = {threshold:.3f}')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='x', alpha=0.13, linewidth=0.5)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis='y', length=0)
 
-    # 合并
-    imp_all = pd.DataFrame(importance_dict).fillna(0)
-    # 按主模型重要性降序
-    if 'Original Preop Model' in imp_all.columns:
-        imp_all = imp_all.sort_values('Original Preop Model', ascending=True)
-
-    n_features = len(imp_all)
-    n_scenarios = len(imp_all.columns)
-    bar_height = 0.22
-    y = np.arange(n_features)
-
-    fig, ax = plt.subplots(figsize=(8, max(6, n_features * 0.45)))
-
-    for i, col in enumerate(imp_all.columns):
-        offset = (i - n_scenarios / 2 + 0.5) * bar_height
-        ax.barh(y + offset, imp_all[col], height=bar_height * 0.9,
-                color=COLORS_LIST[i], label=col, edgecolor='white', linewidth=0.3)
-
-    ax.set_yticks(y)
-    ax.set_yticklabels(imp_all.index, fontsize=8)
-    ax.set_xlabel('Selection Frequency (norm.)')
-    # ax.set_title('Feature Importance Comparison Across Scenarios', fontsize=10, pad=12)
-    ax.set_xlim(0, 1.12)
-    sci_legend(ax, loc='lower right', fontsize=8)
-    ax.grid(axis='x', alpha=0.15, linewidth=0.5)
+    handles = [Rectangle((0, 0), 1, 1, facecolor='#777777', alpha=0.85,
+                         edgecolor='none', label='Correct direction'),
+               Rectangle((0, 0), 1, 1, facecolor='#CCCCCC', alpha=0.65,
+                         edgecolor='none', label='Unchanged'),
+               Rectangle((0, 0), 1, 1, facecolor='#777777', alpha=0.28,
+                         edgecolor='none', label='Wrong direction')]
+    sci_legend(ax, handles=handles, loc='upper center',
+               bbox_to_anchor=(0.42, -0.34), ncol=3, fontsize=5.8)
+    if note:
+        ax.text(0.0, 1.06, note, transform=ax.transAxes, fontsize=6.2,
+                color='#555555', va='bottom', ha='left')
 
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.close()
-
-plot_importance_comparison(SCENARIOS,
-                           save_path='figures/Feature_Importance_Compare.png')
-print("✅ Importance comparison saved")
+    _supp_save(save_path)
+    return fig
 
 
-print("\n===== 所有可视化完成 =====")
+# ==========================================================================================
+# 10.5 单个「比较」的完整评估：绝对指标 + Δ指标(95%CI) + 重分类 + 决策曲线数字
+# ==========================================================================================
+# Δ 指标在森林图中的分栏（量纲差异大，必须分栏，否则小量纲指标会被压成一个点）
+_INCR_PANEL_OF = {
+    'AUROC':           'Discrimination and overall accuracy',
+    'AP':              'Discrimination and overall accuracy',
+    'Brier':           'Discrimination and overall accuracy',
+    'Scaled_Brier':    'Discrimination and overall accuracy',
+    'Cal_slope':       'Calibration',
+    'Cal_intercept':   'Calibration',
+    'OE':              'Calibration',
+    'NB_at_threshold': 'Clinical utility (decision curve)',
+}
+
+
+def _incr_multimetric_rows(dlt, cohort, metrics=None):
+    """把一个队列的 Δ 汇总转成森林图行（带 panel 分栏）"""
+    metrics = metrics or ['AUROC', 'AP', 'Brier', 'Scaled_Brier',
+                          'Cal_slope', 'Cal_intercept', 'OE', 'NB_at_threshold']
+    return [{'label': _INCR_METRIC_LABEL[m], 'cohort': cohort,
+             'panel': _INCR_PANEL_OF[m], 'delta': dlt[m]['delta'],
+             'lo': dlt[m]['lo'], 'hi': dlt[m]['hi'], 'p': dlt[m]['p']}
+            for m in metrics if m in dlt]
+
+
+def _incr_evaluate_pair(comparison, cohort, y, p_base, p_new, threshold,
+                        framework, model_desc, base_label, new_label,
+                        n_boot=None, record_dca=True):
+    """
+    对「同一队列、同一批患者的两套预测概率」做全套比较，并把结果写进各收集器。
+    返回 (delta_summary, delta_samples, delong_result)
+    """
+    y = np.asarray(y, dtype=int)
+    p_base = np.asarray(p_base, dtype=float)
+    p_new = np.asarray(p_new, dtype=float)
+
+    abs_sum, dlt_sum, dlt_samp, pt_base, pt_new = _incr_paired_bootstrap(
+        y, p_base, p_new, threshold, n_boot=n_boot)
+    dl = delong_roc_test(y, p_base, p_new)
+
+    # ---- 绝对指标表（两行：base / extended）----
+    for tag, label, pt, ab in [('Base', base_label, pt_base, abs_sum['base']),
+                               ('Extended', new_label, pt_new, abs_sum['new'])]:
+        row = {
+            'Comparison': comparison, 'Cohort': cohort, 'Role': tag,
+            'Model': label, 'Framework': framework, 'Model_specification': model_desc,
+            'N': pt['N'], 'Events': pt['Events'], 'Event_rate': pt['Event_rate'],
+            'Threshold': threshold,
+        }
+        for m in _INCR_BOOT_METRICS:
+            v, lo, hi = ab[m]
+            row[m] = v
+            row[f'{m}_CI_lo'] = lo
+            row[f'{m}_CI_hi'] = hi
+        for extra in ['HL_chi2', 'HL_p', 'TP', 'FP', 'TN', 'FN',
+                      'Sensitivity', 'Specificity', 'PPV', 'NPV']:
+            row[extra] = pt.get(extra, np.nan)
+        # AUROC 的解析 CI（DeLong）与 bootstrap CI 并列，便于互相核对
+        row['AUROC_DeLong_CI_lo'] = dl['AUROC_base_lo'] if tag == 'Base' else dl['AUROC_new_lo']
+        row['AUROC_DeLong_CI_hi'] = dl['AUROC_base_hi'] if tag == 'Base' else dl['AUROC_new_hi']
+        _INCR_ROWS_METRICS.append(row)
+
+    # ---- Δ 指标表（审稿问题 5 的核心）----
+    for m in _INCR_BOOT_METRICS:
+        d = dlt_sum[m]
+        higher_better = _INCR_HIGHER_BETTER.get(m)
+        if higher_better is None:
+            favours = 'n/a (target value, not "higher is better")'
+        elif (higher_better and d['delta'] > 0) or ((not higher_better) and d['delta'] < 0):
+            favours = 'extended (with intraoperative)'
+        else:
+            favours = 'base (preoperative only)'
+        _INCR_ROWS_DELTAS.append({
+            'Comparison': comparison, 'Cohort': cohort, 'Framework': framework,
+            'Metric': m, 'Metric_label': _INCR_METRIC_LABEL[m],
+            'Value_base': pt_base[m], 'Value_extended': pt_new[m],
+            'Delta': d['delta'], 'CI_lo': d['lo'], 'CI_hi': d['hi'],
+            'p_value': d['p'],
+            'CI_method': f"paired stratified bootstrap ({d['n_boot_used']} resamples)",
+            'Favours': favours,
+            'CI_excludes_zero': (np.isfinite(d['lo']) and np.isfinite(d['hi'])
+                                 and not (d['lo'] <= 0 <= d['hi'])),
+            'N': pt_base['N'], 'Events': pt_base['Events'], 'Threshold': threshold,
+        })
+
+    # ΔAUROC 追加一行 DeLong 解析结果（与 bootstrap 互为印证）
+    _INCR_ROWS_DELTAS.append({
+        'Comparison': comparison, 'Cohort': cohort, 'Framework': framework,
+        'Metric': 'AUROC', 'Metric_label': 'ΔAUROC',
+        'Value_base': dl['AUROC_base'], 'Value_extended': dl['AUROC_new'],
+        'Delta': dl['Delta_AUROC'], 'CI_lo': dl['CI_lo'], 'CI_hi': dl['CI_hi'],
+        'p_value': dl['p_value'], 'CI_method': 'DeLong test (correlated ROC curves)',
+        'Favours': ('extended (with intraoperative)' if dl['Delta_AUROC'] > 0
+                    else 'base (preoperative only)'),
+        'CI_excludes_zero': (np.isfinite(dl['p_value']) and dl['p_value'] < 0.05),
+        'N': pt_base['N'], 'Events': pt_base['Events'], 'Threshold': threshold,
+    })
+
+    # ---- 重分类（cfNRI / 分类 NRI / IDI）----
+    nri = _incr_nri_idi(y, p_base, p_new, threshold, n_boot=n_boot)
+    for key, lbl in [('cfNRI', 'Continuous (category-free) NRI'),
+                     ('cfNRI_ev', '  cfNRI — events component'),
+                     ('cfNRI_ne', '  cfNRI — non-events component'),
+                     ('catNRI', 'Categorical NRI (at locked threshold)'),
+                     ('catNRI_ev', '  Categorical NRI — events component'),
+                     ('catNRI_ne', '  Categorical NRI — non-events component'),
+                     ('IDI', 'IDI'),
+                     ('IDI_ev', '  IDI — events component'),
+                     ('IDI_ne', '  IDI — non-events component')]:
+        r = nri[key]
+        _INCR_ROWS_RECLASS.append({
+            'Comparison': comparison, 'Cohort': cohort, 'Framework': framework,
+            'Index': lbl, 'Index_code': key,
+            'Value': r['value'], 'CI_lo': r['lo'], 'CI_hi': r['hi'], 'p_value': r['p'],
+            'CI_method': 'paired stratified bootstrap',
+            'Threshold': threshold, 'N': len(y), 'Events': int(y.sum()),
+            **{f'n_{k}': v for k, v in nri['_counts'].items()},
+        })
+
+    # ---- 决策曲线的数字底稿（全阈值净获益）----
+    if record_dca:
+        prev = float(y.mean())
+        for t in np.arange(0.01, min(INCR_DCA_XMAX, 0.99) + 1e-9, 0.01):
+            _INCR_ROWS_DCA.append({
+                'Comparison': comparison, 'Cohort': cohort, 'Framework': framework,
+                'Threshold_probability': round(float(t), 4),
+                'NB_base': calculate_net_benefit(y, p_base, t),
+                'NB_extended': calculate_net_benefit(y, p_new, t),
+                'Delta_NB': (calculate_net_benefit(y, p_new, t)
+                             - calculate_net_benefit(y, p_base, t)),
+                'NB_treat_all': prev - (1 - prev) * (t / (1 - t)),
+                'NB_treat_none': 0.0,
+                'High_risk_per_1000_base': calculate_n_high_risk(p_base, t, len(y)),
+                'High_risk_per_1000_extended': calculate_n_high_risk(p_new, t, len(y)),
+            })
+
+    print(f"    {cohort:<12} {comparison:<46} "
+          f"ΔAUROC = {dl['Delta_AUROC']:+.4f} "
+          f"(95% CI {dl['CI_lo']:+.4f} to {dl['CI_hi']:+.4f}, DeLong p = {_fmt_p(dl['p_value'])}) | "
+          f"ΔBrier = {dlt_sum['Brier']['delta']:+.4f} | "
+          f"ΔNB = {dlt_sum['NB_at_threshold']['delta']:+.4f}")
+
+    return dlt_sum, dlt_samp, dl
+
+
+def _incr_pair_figures(cohort, y, p_base, p_new, threshold,
+                       label_base, label_new, coh_txt, prefix='S5'):
+    """一个队列下的成套对比图：校准 / 决策 / ROC / PR / 一致性 / 重分类"""
+    note_txt = f'{coh_txt}\nN = {len(y)}, events = {int(np.sum(y))}'
+    series = [
+        {'y': y, 'prob': p_base, 'label': label_base,
+         'color': INCR_MODEL_COLOR['base'], 'marker': 'o'},
+        {'y': y, 'prob': p_new, 'label': label_new,
+         'color': INCR_MODEL_COLOR['new'], 'marker': 's'},
+    ]
+
+    plot_calibration_multi(
+        series, f'{INCR_DIR}/{prefix}C_Calibration_{cohort}.png',
+        n_bootstrap=INCR_N_BOOT_CAL, note=note_txt,
+        record_tag=f'{prefix}C_Calibration_{cohort}')
+
+    plot_dca_multi(
+        [{k: v for k, v in s.items() if k != 'marker'} for s in series],
+        f'{INCR_DIR}/{prefix}D_DCA_{cohort}.png',
+        locked_threshold=threshold, n_bootstrap=INCR_N_BOOT_DCA,
+        record_tag=f'{prefix}D_DCA_{cohort}')
+
+    plot_incr_roc_compare(
+        y, p_base, p_new, 'Preoperative', 'Pre + intraoperative',
+        f'{INCR_DIR}/{prefix}E_ROC_{cohort}.png', note=note_txt,
+        record_tag=f'{prefix}E_ROC_{cohort}')
+
+    plot_incr_pr_compare(
+        y, p_base, p_new, 'Preoperative', 'Pre + intraoperative',
+        f'{INCR_DIR}/{prefix}F_PR_{cohort}.png', note=note_txt,
+        record_tag=f'{prefix}F_PR_{cohort}')
+
+    plot_agreement_scatter(
+        p_base, p_new, y,
+        xlabel='Preoperative model — predicted risk',
+        ylabel='Pre + intraoperative model — predicted risk',
+        save_path=f'{INCR_DIR}/{prefix}G_Agreement_{cohort}.png',
+        threshold=threshold, record_tag=f'{prefix}G_Agreement_{cohort}')
+
+    plot_incr_reclass_flow(
+        y, p_base, p_new, threshold,
+        f'{INCR_DIR}/{prefix}H_Reclassification_{cohort}.png',
+        note=note_txt.replace('\n', ' · '),
+        record_tag=f'{prefix}H_Reclassification_{cohort}')
+
+
+
+# ==========================================================================================
+# 10.7 S5 主流程
+# ==========================================================================================
+def run_supp_S5_intraoperative_increment():
+    set_sci_style()
+    os.makedirs(INCR_DIR, exist_ok=True)
+
+    fa = _incr_load_framework_A()
+    df_dev, df_ext, intra_src = _incr_load_intraop_frames()
+
+    headline = {}            # 结论守卫用（取「联合加入」的主分析结果）
+    dAUC_samples = {}        # ΔAUROC 的 bootstrap 分布（图 S5I）
+    forest_auroc_rows = []   # 图 S5A：逐项 vs 联合
+    multimetric_rows = []    # 图 S5B：多指标 Δ（两队列合并成一张图）
+    has_external = False
+
+    # ---------------------------------------------------------------
+    # A. Framework A —— 全流水线重训的「联合加入」模型（主分析）
+    # ---------------------------------------------------------------
+    if fa is not None:
+        print("\n  [S5-A] Framework A：术前模型 vs 术前+术中模型"
+              "（三个术中变量联合加入，与主模型同源的完整建模流水线）")
+        model_desc = (f"Same nested-CV pipeline as the primary model "
+                      f"(preoperative best model = {fa['preop_model_name']}; "
+                      f"pre + intraoperative best model = {fa['intraop_model_name']}); "
+                      f"all three intraoperative variables entered jointly")
+        thr = clinical_threshold      # 固定在术前模型的锁定阈值上比较，保证同一操作点
+
+        cohorts = [('Development', fa['y_dev'], fa['p_dev_base'], fa['p_dev_new'],
+                    'Internal validation (OOF)')]
+        if fa['y_ext'] is not None and len(fa['y_ext']) > 0:
+            cohorts.append(('External', fa['y_ext'], fa['p_ext_base'], fa['p_ext_new'],
+                            'External validation'))
+            has_external = True
+
+        for cname, yy, pb, pn, coh_txt in cohorts:
+            dlt, samp, dl = _incr_evaluate_pair(
+                comparison='Joint (all 3 intraoperative) — full re-training',
+                cohort=cname, y=yy, p_base=pb, p_new=pn, threshold=thr,
+                framework='A: full pipeline re-training',
+                model_desc=model_desc,
+                base_label='Preoperative model',
+                new_label='Pre + intraoperative model')
+
+            headline[cname] = {'dAUROC': dl['Delta_AUROC'], 'lo': dl['CI_lo'],
+                               'hi': dl['CI_hi'], 'p': dl['p_value'],
+                               'dBrier': dlt['Brier']['delta'],
+                               'dNB': dlt['NB_at_threshold']['delta']}
+            dAUC_samples[cname] = samp['AUROC']
+            forest_auroc_rows.append({
+                'label': INCR_SHORT_LABEL['Preop_Intraop'], 'cohort': cname,
+                'delta': dl['Delta_AUROC'], 'lo': dl['CI_lo'], 'hi': dl['CI_hi'],
+                'p': dl['p_value']})
+            multimetric_rows += _incr_multimetric_rows(dlt, cname)
+
+            _incr_pair_figures(cname, yy, pb, pn, thr,
+                               'Preoperative model', 'Pre + intraoperative model',
+                               coh_txt)
+
+    # ---------------------------------------------------------------
+    # B. Framework B 
+    # ---------------------------------------------------------------
+    if df_dev is not None:
+        print("\n  [S5-B] Framework B：以术前模型线性预测值为锚的增量 logistic 回归"
+              "（逐项加入 + 联合加入）")
+
+        y_dev_b = np.asarray(y_int, dtype=int)
+        y_ext_b = np.asarray(y_ext, dtype=int)
+        ok_dev = (len(df_dev) == len(y_dev_b))
+        ok_ext = (len(df_ext) == len(y_ext_b))
+        if not ok_dev:
+            print(f"  ⚠️ 开发队列行数不匹配（原始表 {len(df_dev)} vs OOF 预测 {len(y_dev_b)}），"
+                  f"跳过 Framework B")
+        else:
+            lp_dev = _incr_logit(prob_int)                 # 开发队列锚 = OOF 概率
+            lp_ext = _incr_logit(prob_ext) if ok_ext else None
+            if not ok_ext:
+                print(f"  ⚠️ 外部队列行数不匹配（原始表 {len(df_ext)} vs 预测 {len(y_ext_b)}），"
+                      f"Framework B 仅在开发队列进行")
+
+            var_sets = [(f'Add_{v}', [v]) for v in INCR_VARS] + \
+                       [('Add_All_Intraop', list(INCR_VARS))]
+
+            for set_code, varlist in var_sets:
+                miss = [v for v in varlist if v not in df_dev.columns]
+                if miss:
+                    print(f"  ⚠️ 缺少变量 {miss}，跳过 {set_code}")
+                    continue
+
+                Zd, Ze, cols, is_bin, units = _incr_build_Z(df_dev, df_ext, varlist)
+                if Zd is None:
+                    continue
+
+                res = _incr_fit_framework_B(
+                    lp_dev, Zd, y_dev_b, lp_ext,
+                    (Ze if ok_ext else np.zeros((1, Zd.shape[1]))),
+                    is_bin, cols)
+
+                joint = (len(varlist) > 1)
+                comparison = ('Joint (all 3 intraoperative) — LP-anchored' if joint
+                              else f'Individual: + {rename_feature(varlist[0])}')
+                model_desc = ('Logistic regression: logit(preoperative predicted risk) as '
+                              'anchor covariate + '
+                              + ', '.join(rename_feature(c) for c in cols)
+                              + '; median imputation and standardisation of continuous '
+                                'covariates fitted inside each cross-validation fold')
+
+                # ---- 系数 / LRT 表 ----
+                for cr, un in zip(res['coef_rows'], units):
+                    _INCR_ROWS_COEF.append({
+                        'Comparison': comparison,
+                        'Entry': 'Joint' if joint else 'Individual',
+                        'Cohort': 'Development (full-cohort fit)',
+                        'Framework': 'B: LP-anchored incremental logistic',
+                        **cr, 'Unit': un,
+                        'LRT_chi2': res['lrt']['chi2'], 'LRT_df': res['lrt']['df'],
+                        'LRT_p': res['lrt']['p'],
+                        'Anchor_beta_logit_preop': res['anchor_beta'],
+                        'N': res['n_dev'], 'Events': int(y_dev_b.sum()),
+                    })
+                print(f"    · {comparison:<46} LRT χ²({res['lrt']['df']}) = "
+                      f"{res['lrt']['chi2']:.2f}, p = {_fmt_p(res['lrt']['p'])}")
+
+                # ---- 开发队列（OOF）----
+                dlt_d, samp_d, dl_d = _incr_evaluate_pair(
+                    comparison=comparison, cohort='Development',
+                    y=y_dev_b, p_base=res['oof_base'], p_new=res['oof_new'],
+                    threshold=clinical_threshold,
+                    framework='B: LP-anchored incremental logistic',
+                    model_desc=model_desc,
+                    base_label='Preoperative model (anchored)',
+                    new_label=comparison, record_dca=joint)
+                forest_auroc_rows.append({
+                    'label': INCR_SHORT_LABEL.get(set_code, comparison),
+                    'cohort': 'Development', 'delta': dl_d['Delta_AUROC'],
+                    'lo': dl_d['CI_lo'], 'hi': dl_d['CI_hi'], 'p': dl_d['p_value']})
+
+                # ---- 外部队列 ----
+                dlt_e = dl_e = samp_e = None
+                if ok_ext and res['ext_base'] is not None:
+                    has_external = True
+                    dlt_e, samp_e, dl_e = _incr_evaluate_pair(
+                        comparison=comparison, cohort='External',
+                        y=y_ext_b, p_base=res['ext_base'], p_new=res['ext_new'],
+                        threshold=clinical_threshold,
+                        framework='B: LP-anchored incremental logistic',
+                        model_desc=model_desc,
+                        base_label='Preoperative model (anchored)',
+                        new_label=comparison, record_dca=joint)
+                    forest_auroc_rows.append({
+                        'label': INCR_SHORT_LABEL.get(set_code, comparison),
+                        'cohort': 'External', 'delta': dl_e['Delta_AUROC'],
+                        'lo': dl_e['CI_lo'], 'hi': dl_e['CI_hi'], 'p': dl_e['p_value']})
+
+                # 若 Framework A 不可用，用「联合加入」的 Framework B 结果充当结论依据，
+                # 并补齐校准 / 决策曲线等成套图，保证审稿人要的图在任何情况下都有。
+                if joint and fa is None:
+                    headline['Development'] = {
+                        'dAUROC': dl_d['Delta_AUROC'], 'lo': dl_d['CI_lo'],
+                        'hi': dl_d['CI_hi'], 'p': dl_d['p_value'],
+                        'dBrier': dlt_d['Brier']['delta'],
+                        'dNB': dlt_d['NB_at_threshold']['delta']}
+                    dAUC_samples['Development'] = samp_d['AUROC']
+                    multimetric_rows += _incr_multimetric_rows(dlt_d, 'Development')
+                    _incr_pair_figures(
+                        'Development', y_dev_b, res['oof_base'], res['oof_new'],
+                        clinical_threshold, 'Preoperative model (anchored)',
+                        'Pre + intraoperative model', 'Internal validation (OOF)')
+
+                    if ok_ext and dlt_e is not None:
+                        headline['External'] = {
+                            'dAUROC': dl_e['Delta_AUROC'], 'lo': dl_e['CI_lo'],
+                            'hi': dl_e['CI_hi'], 'p': dl_e['p_value'],
+                            'dBrier': dlt_e['Brier']['delta'],
+                            'dNB': dlt_e['NB_at_threshold']['delta']}
+                        dAUC_samples['External'] = samp_e['AUROC']
+                        multimetric_rows += _incr_multimetric_rows(dlt_e, 'External')
+                        _incr_pair_figures(
+                            'External', y_ext_b, res['ext_base'], res['ext_new'],
+                            clinical_threshold, 'Preoperative model (anchored)',
+                            'Pre + intraoperative model', 'External validation')
+
+    # ---------------------------------------------------------------
+    # C. 汇总图：S5A 逐项 vs 联合、S5B 多指标 Δ、S5I bootstrap 分布
+    # ---------------------------------------------------------------
+    if forest_auroc_rows:
+        order = [INCR_SHORT_LABEL['Add_Surgery_Duration'],
+                 INCR_SHORT_LABEL['Add_PFCL'],
+                 INCR_SHORT_LABEL['Add_Phacovitrectomy'],
+                 INCR_SHORT_LABEL['Add_All_Intraop'],
+                 INCR_SHORT_LABEL['Preop_Intraop']]
+        rank = {lab: i for i, lab in enumerate(order)}
+        forest_auroc_rows.sort(key=lambda r: (rank.get(r['label'], 99),
+                                              0 if r['cohort'] == 'Development' else 1))
+        print("\n  · S5A 逐项 vs 联合 ΔAUROC 森林图")
+        plot_delta_forest(
+            forest_auroc_rows, f'{INCR_DIR}/S5A_Incremental_AUROC_Forest.png',
+            xlabel='ΔAUROC versus preoperative model',
+            rope=(-INCR_ROPE_AUROC, INCR_ROPE_AUROC),
+            title_note='Intraoperative variables entered individually and jointly',
+            record_tag='S5A_Incremental_AUROC_Forest')
+
+    if multimetric_rows:
+        print("  · S5B 多指标 Δ 森林图（AUROC / AP / Brier / 校准 / 净获益）")
+        plot_delta_forest(
+            multimetric_rows, f'{INCR_DIR}/S5B_DeltaMetrics_Forest.png',
+            xlabel='Δ (pre + intraoperative − preoperative)',
+            rope=(-INCR_ROPE_AUROC, INCR_ROPE_AUROC),
+            rope_panels=['Discrimination and overall accuracy'],
+            title_note=(f'Joint model — paired stratified bootstrap, '
+                        f'{INCR_N_BOOT} resamples'),
+            record_tag='S5B_DeltaMetrics_Forest')
+
+    if dAUC_samples:
+        print("  · S5I ΔAUROC 配对 bootstrap 分布图")
+        plot_incr_delta_distribution(
+            dAUC_samples, f'{INCR_DIR}/S5I_DeltaAUROC_Bootstrap.png',
+            metric_label='ΔAUROC', rope=(-INCR_ROPE_AUROC, INCR_ROPE_AUROC),
+            record_tag='S5I_DeltaAUROC_Bootstrap')
+
+
+    # ---------------------------------------------------------------
+    # F. 导出全部 CSV
+    # ---------------------------------------------------------------
+    exported = []
+    for rows, fname in [
+            (_INCR_ROWS_SPEC,    f'Table_S5_Analysis_Specification_{TIMESTAMP}.csv'),
+            (_INCR_ROWS_DELTAS,  f'Table_S5_Delta_Metrics_{TIMESTAMP}.csv'),
+            (_INCR_ROWS_METRICS, f'Table_S5_Absolute_Metrics_{TIMESTAMP}.csv'),
+            (_INCR_ROWS_COEF,    f'Table_S5_Coefficients_LRT_{TIMESTAMP}.csv'),
+            (_INCR_ROWS_RECLASS, f'Table_S5_Reclassification_{TIMESTAMP}.csv'),
+            (_INCR_ROWS_DCA,     f'Table_S5_DecisionCurve_NetBenefit_{TIMESTAMP}.csv')]:
+        if not rows:
+            continue
+        path = os.path.join(INCR_DIR, fname)
+        try:
+            pd.DataFrame(rows).to_csv(path, index=False, encoding='utf-8-sig')
+            exported.append(path)
+        except Exception as e:
+            print(f"  ⚠️ 导出 {fname} 失败: {e}")
+
+    print("\n  ── S5 导出的详细对比指标 CSV ──")
+    for p in exported:
+        print(f"     ✓ {p}")
+
+
+if INCR_ENABLE:
+    try:
+        _INCR_RESULT = run_supp_S5_intraoperative_increment()
+    except FileNotFoundError as e:
+        print(f"⚠️ 跳过 S5 术中增量价值分析（缺少文件）: {e}")
+        _INCR_RESULT = None
+    except Exception as e:
+        import traceback
+        print(f"⚠️ S5 术中增量价值分析出错: {e}")
+        traceback.print_exc()
+        _INCR_RESULT = None
+else:
+    print("ℹ️ INCR_ENABLE = False，已跳过 S5 术中增量价值分析。")
+    _INCR_RESULT = None
+
+# S5 复用了 S1–S4 的部分绘图函数，会继续往 _SUPP_STATS_ROWS 追加记录；
+# 这里重新导出一次，保证汇总表包含 S5 的行。
+if _SUPP_STATS_ROWS:
+    try:
+        _out_csv = f'{DATA_PATH}/Supp_S1S4_Plot_Stats_{TIMESTAMP}.csv'
+        pd.DataFrame(_SUPP_STATS_ROWS).to_csv(_out_csv, index=False, encoding='utf-8-sig')
+        print(f"\n  ✓ 补充图统计量汇总（含 S5）已刷新: {_out_csv}")
+    except Exception as e:
+        print(f"  ⚠️ 统计量汇总刷新失败: {e}")
+
+
+# ==========================================================
+# 十一、完成
+# ==========================================================
+set_sci_style()
+print("\n" + "=" * 60)
+print("✅ 全部图形生成完毕")
+print("-" * 60)
+print("   正文六图  : ROC_Internal / ROC_External / PR_Internal / PR_External /")
+print(f"               Calibration_Publication_v2_{TIMESTAMP} / DCA_Analysis")
+print("   叠加版    : ROC_Internal_vs_External / PR_Internal_vs_External")
+print("               (+ ROC_PR_Internal_vs_External_Metrics.csv)")
+print("   混淆矩阵  : Confusion_Matrix_Internal / _External / _Comparison / _Comparison2")
+print("   风险分层  : Figure2A_Risk_Gradient / Figure2B_Event_Concentration")
+print("   特征稳定性: LASSO_Lollipop_*")
+print("   SHAP      : FigG / FigH / Fig3A–3D / FigAL_Dependence_Dev_vs_Ext")
+print("   补充图 S1 : S1_Calibration_Internal/_External, S1_DCA_Internal/_External,")
+print("               S1_Agreement_Internal/_External")
+print("   补充图 S2 : S2_External_Calibration, S2_External_RiskStratification")
+print("   补充图 S3 : S3_CompleteCases_Calibration, S3_CompleteCases_DCA")
+print("   补充图 S4 : S4_Sensitivity_Calibration_*, S4_Sensitivity_DCA_*,")
+print("               S4_Sensitivity_Forest_External")
+print("   补充图 S5 : S5A_Incremental_AUROC_Forest, S5B_DeltaMetrics_Forest,")
+print("               S5C–S5H (Calibration / DCA / ROC / PR / Agreement / Reclassification),")
+print("               S5I_DeltaAUROC_Bootstrap")
+print("               Table_S5_*.csv (Analysis_Specification / Delta_Metrics /")
+print("               Absolute_Metrics / Coefficients_LRT / Reclassification /")
+print("               DecisionCurve_NetBenefit / Conclusion_Statement)")
+print("-" * 60)
+print("   ⚠️ 全部分析基于原始预测概率与原始锁定阈值。")
+print(f"   自检：内部 AUROC={oof_auc:.3f} / AP={oof_ap:.3f}，"
+      f"外部 AUROC={ext_auc:.3f} / AP={ext_ap:.3f}")
+print("=" * 60)
+
