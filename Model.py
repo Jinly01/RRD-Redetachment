@@ -443,8 +443,8 @@ class MultiModelTrainer:
     # ------------------------------------------------------------------
     def get_model_configs(self, n_pos, n_neg):
 
+        # ★ 所有算法取消 class weighting（无 class_weight 参数）
         lr_common = {
-            'class_weight': 'balanced',
             'max_iter': 10000,
             'random_state': self.random_state
         }
@@ -452,7 +452,7 @@ class MultiModelTrainer:
         feature_selector = SelectFromModel(
             LogisticRegression(
                 penalty='l1', solver='liblinear',
-                C=0.5, class_weight='balanced',
+                C=0.5,
                 max_iter=10000, random_state=self.random_state
             ),
             threshold='median'
@@ -460,17 +460,18 @@ class MultiModelTrainer:
 
 
         configs = {
-            # 'LR_LASSO': {
-            #     'pipeline': Pipeline([
-            #         ('preprocessor', clone(self.preprocessor)),
-            #         ('classifier', LogisticRegression(
-            #             penalty='l1', solver='liblinear', **lr_common))
-            #     ]),
-            #     'params': {
-            #         'classifier__C': [0.1, 0.5, 1.0]
-            #     }
-            # },
+            # ★ 新增 Plain LR（无正则化，最简模型）
+            'Plain_LR': {
+                'pipeline': Pipeline([
+                    ('preprocessor', clone(self.preprocessor)),
+                    ('selector', clone(feature_selector)),
+                    ('classifier', LogisticRegression(
+                        penalty=None, solver='lbfgs', **lr_common))
+                ]),
+                'params': {}  # 无超参数可调
+            },
 
+            # ★ 保留 unweighted Ridge
             'LR_Ridge': {
                 'pipeline': Pipeline([
                     ('preprocessor', clone(self.preprocessor)),
@@ -489,7 +490,6 @@ class MultiModelTrainer:
                     ('selector', clone(feature_selector)),
                     ('classifier', RandomForestClassifier(
                         n_estimators=100,
-                        class_weight='balanced_subsample',
                         random_state=self.random_state,
                         n_jobs=-1
                     ))
@@ -505,7 +505,7 @@ class MultiModelTrainer:
                     ('preprocessor', clone(self.preprocessor)),
                     ('selector', clone(feature_selector)),
                     ('classifier', SVC(
-                        kernel='rbf', class_weight='balanced',
+                        kernel='rbf',
                         probability=True, random_state=self.random_state
                     ))
                 ]),
@@ -516,6 +516,7 @@ class MultiModelTrainer:
         }
 
         if XGBClassifier is not None:
+            # ★ scale_pos_weight 固定为 1（不做 class balancing）
             configs['XGBoost'] = {
                 'pipeline': Pipeline([
                     ('preprocessor', clone(self.preprocessor)),
@@ -529,14 +530,12 @@ class MultiModelTrainer:
                         colsample_bytree=0.8,
                         reg_alpha=1,
                         reg_lambda=5,
-                        min_child_weight=5
+                        min_child_weight=5,
+                        scale_pos_weight=1      # ★ 显式固定=1
                     ))
                 ]),
                 'params': {
                     'classifier__max_depth': [2, 3],
-                    'classifier__scale_pos_weight': [
-                        1, round(n_neg / n_pos)
-                    ]
                 }
             }
 
@@ -822,7 +821,6 @@ class MultiModelTrainer:
                 print(f"   ❌ {name} 训练失败: {e}")
                 import traceback
                 traceback.print_exc()
-
         # ==============================================================
         # 阶段1.5: Stacking 集成模型
         # ==============================================================
@@ -831,8 +829,9 @@ class MultiModelTrainer:
         print(f"{'='*60}")
 
         try:
-            # 定义模型类型，用于多样性筛选
+            # 【修改】定义模型类型，用于多样性筛选
             model_types = {
+                'Plain_LR': 'linear',
                 'LR_Ridge': 'linear',
                 'SVM_RBF': 'kernel',
                 'RandomForest': 'tree',
@@ -879,7 +878,7 @@ class MultiModelTrainer:
                 estimators=estimators,
                 final_estimator=LogisticRegression(
                     penalty='l2', C=1.0, max_iter=10000,
-                    class_weight='balanced', random_state=self.random_state
+                    random_state=self.random_state
                 ),
                 cv=StratifiedKFold(n_splits=cv_folds, shuffle=True,
                                    random_state=self.random_state),
@@ -1013,6 +1012,41 @@ class MultiModelTrainer:
         print(f"{'='*60}")
 
         best_name, scores, valid_models, selection_reason = self._select_best_model(cv_results, y_train_arr)
+
+        # ==============================================================
+        # ★ Parsimony Rule: XGBoost vs Plain_LR 内部等效性检验
+        #   若二者 development OOF 指标实质等效，升级 Plain_LR 为主模型
+        # ==============================================================
+        PARSIMONY_AUC_TOL = 0.02    # AUC 差距容忍度
+        PARSIMONY_AP_TOL  = 0.03    # AUPRC 差距容忍度
+
+        if ('Plain_LR' in cv_results and 'XGBoost' in cv_results
+                and best_name not in ('Plain_LR',)):
+            plr = cv_results['Plain_LR']
+            xgb = cv_results['XGBoost']
+            auc_diff = abs(plr['auc_oof'] - xgb['auc_oof'])
+            ap_diff  = abs(plr['ap_oof']  - xgb['ap_oof'])
+
+            print(f"\n{'='*60}")
+            print(f"🔬 Parsimony Rule: Plain_LR vs XGBoost 内部等效性检验")
+            print(f"{'='*60}")
+            print(f"   Plain_LR  OOF AUC={plr['auc_oof']:.4f}, AP={plr['ap_oof']:.4f}, "
+                  f"Brier={plr['brier_oof']:.4f}")
+            print(f"   XGBoost   OOF AUC={xgb['auc_oof']:.4f}, AP={xgb['ap_oof']:.4f}, "
+                  f"Brier={xgb['brier_oof']:.4f}")
+            print(f"   |ΔAUC|={auc_diff:.4f} (tol={PARSIMONY_AUC_TOL}), "
+                  f"|ΔAP|={ap_diff:.4f} (tol={PARSIMONY_AP_TOL})")
+
+            if auc_diff <= PARSIMONY_AUC_TOL and ap_diff <= PARSIMONY_AP_TOL:
+                best_name = 'Plain_LR'
+                selection_reason = (
+                    f"Parsimony Rule: Plain_LR 与 XGBoost 内部实质等效 "
+                    f"(|ΔAUC|={auc_diff:.4f}≤{PARSIMONY_AUC_TOL}, "
+                    f"|ΔAP|={ap_diff:.4f}≤{PARSIMONY_AP_TOL})，选最简模型"
+                )
+                print(f"   ✅ 等效成立 → 升级 Plain_LR 为主模型 (parsimony)")
+            else:
+                print(f"   ❌ 等效不成立 → 维持原选择: {best_name}")
 
         best_res = valid_models[best_name]
         reason = (
@@ -1154,8 +1188,8 @@ class MultiModelTrainer:
         
         # 定义模型复杂度排名（数值越小越简单）
         simplicity_rank = {
-            'LR_ElasticNet': 1, 'LR_Ridge': 2,
-            'SVM_RBF': 3, 'RandomForest': 4, 'XGBoost': 5, 'Stacking': 6
+            'Plain_LR': 1, 'LR_Ridge': 2, 'LR_ElasticNet': 3,
+            'SVM_RBF': 4, 'RandomForest': 5, 'XGBoost': 6, 'Stacking': 7
         }
 
         # ==============================================================
@@ -1231,7 +1265,7 @@ class MultiModelTrainer:
         # ==============================================================
         ap_candidates = ap_candidates.sort_values(by='Brier', ascending=True).reset_index(drop=True)
         best_brier = ap_candidates.iloc[0]['Brier']
-        brier_candidates = ap_candidates[ap_candidates['Brier'] <= (best_brier + 0.002)].copy()
+        brier_candidates = ap_candidates[ap_candidates['Brier'] <= (best_brier + 0.005)].copy()
 
         # ==============================================================
         # Step 7: Brier 接近时，比较 MCC（不平衡数据分类质量）
@@ -1240,7 +1274,7 @@ class MultiModelTrainer:
         if len(brier_candidates) > 1:
             brier_candidates = brier_candidates.sort_values(by='MCC', ascending=False).reset_index(drop=True)
             best_mcc = brier_candidates.iloc[0]['MCC']
-            mcc_candidates = brier_candidates[brier_candidates['MCC'] >= (best_mcc - 0.01)].copy()
+            mcc_candidates = brier_candidates[brier_candidates['MCC'] >= (best_mcc - 0.02)].copy()
         else:
             mcc_candidates = brier_candidates.copy()
 
@@ -1544,6 +1578,95 @@ if __name__ == "__main__":
         best_model = results['final_model']
         optimal_thresh = results['optimal_threshold']
         best_model_name = results['best_model_name']
+
+        # --------------------------------------------------------
+        # 3.5 ★ External 主文: XGBoost vs Plain_LR 直接比较
+        # --------------------------------------------------------
+        print(f"\n{'='*60}")
+        print("📊 External Head-to-Head: XGBoost vs Plain_LR")
+        print(f"{'='*60}")
+
+        h2h_models = ['XGBoost', 'Plain_LR']
+        h2h_available = [m for m in h2h_models if m in trainer.models]
+
+        if len(h2h_available) == 2:
+            h2h_results = {}
+            for mname in h2h_available:
+                m_pipeline = trainer.models[mname]
+                m_ext_probs = m_pipeline.predict_proba(X_ext)[:, 1]
+                m_oof_probs = results['cv_results'][mname]['prob_oof']
+
+                # 用 development 阈值（各自的 Youden）
+                m_thresh, _ = MetricsCalculator.find_optimal_threshold(y_train, m_oof_probs)
+                m_int_metrics = MetricsCalculator.calculate_metrics(
+                    y_train, m_oof_probs, m_thresh, n_bootstrap=1000,
+                    random_state=Config.RANDOM_STATE)
+                m_ext_metrics = MetricsCalculator.calculate_metrics(
+                    y_ext, m_ext_probs, m_thresh, n_bootstrap=1000,
+                    random_state=Config.RANDOM_STATE)
+
+                h2h_results[mname] = {
+                    'int_metrics': m_int_metrics,
+                    'ext_metrics': m_ext_metrics,
+                    'threshold': m_thresh,
+                    'ext_probs': m_ext_probs,
+                    'oof_probs': m_oof_probs,
+                }
+
+            # 打印对比表
+            def _ci_str(d, k):
+                lo = d.get(f'{k}_95CI_Low', np.nan)
+                hi = d.get(f'{k}_95CI_High', np.nan)
+                if np.isnan(lo) or np.isnan(hi):
+                    return f"{d[k]:.4f}"
+                return f"{d[k]:.4f} ({lo:.4f}-{hi:.4f})"
+
+            print(f"\n  {'Metric':<20} | {'XGBoost (Ext)':>30} | {'Plain_LR (Ext)':>30} | {'Δ':>8}")
+            print(f"  {'-'*95}")
+            for metric_key in ['AUC', 'AUCPR', 'Brier', 'Sensitivity', 'Specificity',
+                               'PPV', 'NPV', 'F1', 'MCC', 'G_mean', 'Balanced_Acc']:
+                xgb_val = h2h_results['XGBoost']['ext_metrics'][metric_key]
+                plr_val = h2h_results['Plain_LR']['ext_metrics'][metric_key]
+                diff = plr_val - xgb_val
+                print(f"  {metric_key:<20} | {_ci_str(h2h_results['XGBoost']['ext_metrics'], metric_key):>30} | "
+                      f"{_ci_str(h2h_results['Plain_LR']['ext_metrics'], metric_key):>30} | {diff:>+8.4f}")
+            print(f"  {'-'*95}")
+            print(f"  Threshold           | {h2h_results['XGBoost']['threshold']:>30.4f} | "
+                  f"{h2h_results['Plain_LR']['threshold']:>30.4f} |")
+
+            # 保存对比表 CSV
+            h2h_rows = []
+            for mname in h2h_available:
+                row = {'Model': mname, 'Threshold': h2h_results[mname]['threshold']}
+                for ds_label, ds_key in [('Internal_OOF', 'int_metrics'), ('External', 'ext_metrics')]:
+                    m = h2h_results[mname][ds_key]
+                    for k in ['AUC', 'AUCPR', 'Brier', 'Sensitivity', 'Specificity',
+                              'PPV', 'NPV', 'F1', 'MCC', 'G_mean', 'Balanced_Acc']:
+                        lo = m.get(f'{k}_95CI_Low', np.nan)
+                        hi = m.get(f'{k}_95CI_High', np.nan)
+                        if np.isnan(lo):
+                            row[f'{ds_label}_{k}'] = f"{m[k]:.4f}"
+                        else:
+                            row[f'{ds_label}_{k}'] = f"{m[k]:.4f} ({lo:.4f}-{hi:.4f})"
+                h2h_rows.append(row)
+            h2h_ts = datetime.now().strftime('%Y%m%d_%H%M')
+            h2h_df = pd.DataFrame(h2h_rows)
+            h2h_path = f"{Config.OUTPUT_DIR}/HeadToHead_XGB_vs_PlainLR_{h2h_ts}.csv"
+            h2h_df.to_csv(h2h_path, index=False, encoding='utf-8-sig')
+            print(f"\n  ✅ XGBoost vs Plain_LR 对比表已保存: {h2h_path}")
+
+            # 保存 h2h 原始概率 (供 DeLong 等后续分析)
+            h2h_probs_pkg = {
+                'y_external': y_ext.values if hasattr(y_ext, 'values') else np.array(y_ext),
+                'y_internal': y_train.values if hasattr(y_train, 'values') else np.array(y_train),
+            }
+            for mname in h2h_available:
+                h2h_probs_pkg[f'{mname}_ext_probs'] = h2h_results[mname]['ext_probs']
+                h2h_probs_pkg[f'{mname}_oof_probs'] = h2h_results[mname]['oof_probs']
+            joblib.dump(h2h_probs_pkg, f"{Config.OUTPUT_DIR}/HeadToHead_Probs_{h2h_ts}.pkl")
+
+        else:
+            print(f"  ⚠️ 缺少模型: {set(h2h_models) - set(h2h_available)}，跳过 Head-to-Head 对比")
 
         # --------------------------------------------------------
         # 4. 保存可视化所需的模型包
@@ -2175,7 +2298,35 @@ if __name__ == "__main__":
                 'difference': float(auc_int - auc_ext),
                 'is_valid': abs(auc_int - auc_ext) < 0.15
             }
-        print(f"\n✨ 任务成功完成!")
+        # --------------------------------------------------------
+        # 9. ★★★ 综合分析模块 (四大板块) ★★★
+        # --------------------------------------------------------
+        print(f"\n{'='*60}")
+        print("🔬 启动综合分析模块 (四大板块)")
+        print(f"{'='*60}")
+
+        try:
+            from comprehensive_analysis import run_comprehensive_analysis
+
+            run_comprehensive_analysis(
+                trainer=trainer,
+                results=results,
+                X_train=X_train,
+                y_train=y_train,
+                X_ext=X_ext,
+                y_ext=y_ext,
+                log_feats=log_feats,
+                num_feats=num_feats,
+                cat_feats=cat_feats,
+                make_ct_fn=make_column_transformer,
+            )
+        except Exception as e:
+            print(f"  ⚠️ 综合分析模块执行出错: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"  ⚠️ 主流程已完成, 综合分析部分可单独重跑")
+
+        print(f"\n✨ 全部任务成功完成!")
         print(f"{'='*60}")
 
     except Exception as e:
